@@ -45,13 +45,19 @@ in the fork your stack sits on.
 ### Viewing the stack
 
 ```
-forkstack.py log                    # git log --graph --oneline --all --decorate
+forkstack.py log                    # graph of every ref except tags
 forkstack.py log --remote origin    # only this remote's refs (repeatable)
 forkstack.py log --no-remotes -n 20
+forkstack.py log --tags             # bring tags back
 ```
 
-`--remote` filters both what is walked and what is decorated, so a commit shared
-with an excluded remote doesn't still show that remote's name.
+Tags are hidden by default. A repository that tags for CI has thousands of them,
+and each one drags its commit into the graph, so the stack you came to look at
+gets buried; pass `--tags` when you actually want them.
+
+`--remote` and the tag default filter both what is walked and what is decorated,
+so a commit shared with an excluded remote doesn't still show that remote's
+name, and a tagged commit off to the side doesn't take up a row in the graph.
 
 ## Notes
 

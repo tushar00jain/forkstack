@@ -77,13 +77,23 @@ def cmd_log(args):
     if remotes or args.no_remotes:
         # --glob picks what to walk; --decorate-refs keeps the labels in step,
         # otherwise a commit shared with an excluded remote still shows its name.
-        refs = ["refs/heads/*", "refs/tags/*", "HEAD"]
+        refs = ["refs/heads/*", "HEAD"]
         refs += [f"refs/remotes/{r}/*" for r in remotes]
-        cmd += ["--branches", "--tags", "HEAD"]
+        cmd += ["--branches", "HEAD"]
         cmd += [f"--glob=refs/remotes/{r}/*" for r in remotes]
+        if args.tags:
+            refs.append("refs/tags/*")
+            cmd.append("--tags")
         cmd += [f"--decorate-refs={ref}" for ref in refs]
-    else:
+    elif args.tags:
         cmd.append("--all")
+    else:
+        # --exclude only applies to the --all that follows it.
+        cmd += [
+            "--exclude=refs/tags/*",
+            "--all",
+            "--decorate-refs-exclude=refs/tags/*",
+        ]
     if args.max_count:
         cmd.append(f"-{args.max_count}")
     cmd += args.git_args
@@ -198,10 +208,16 @@ def build_parser():
         action="append",
         metavar="NAME",
         help="show only this remote's refs (repeatable, or comma-separated); "
-        "local branches, tags and HEAD are always shown",
+        "local branches and HEAD are always shown",
     )
     lg.add_argument(
         "--no-remotes", action="store_true", help="show no remote refs at all"
+    )
+    lg.add_argument(
+        "--tags",
+        action="store_true",
+        help="also walk and decorate tags (hidden by default: a repository that "
+        "tags for CI buries the stack otherwise)",
     )
     lg.add_argument(
         "-n", "--max-count", type=int, metavar="N", help="limit to N commits"
