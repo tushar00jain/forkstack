@@ -45,15 +45,21 @@ in the fork your stack sits on.
 ### Viewing the stack
 
 ```
-forkstack.py log                    # graph of every ref except tags
-forkstack.py log --remote origin    # only this remote's refs (repeatable)
+forkstack.py log                          # local branches, HEAD and origin's refs
+forkstack.py log --remote origin,upstream # other remotes are opt-in (repeatable)
 forkstack.py log --no-remotes -n 20
-forkstack.py log --tags             # bring tags back
+forkstack.py log --tags                   # bring tags back
 ```
 
-Tags are hidden by default. A repository that tags for CI has thousands of them,
-and each one drags its commit into the graph, so the stack you came to look at
-gets buried; pass `--tags` when you actually want them.
+In the pager, `R` re-runs the walk in place and `q` quits, so watching a stack
+change is one keystroke rather than quit-and-retype. (Needs less 582 or newer;
+on older ones only `q` is bound.)
+
+Only `origin` — the fork the stack is pushed to — is shown by default, and tags
+are hidden. Both defaults exist because the graph is worth nothing once the
+stack is buried: an upstream remote carries every contributor's ghstack refs,
+and a repository that tags for CI has thousands of tags, each dragging its
+commit into the graph.
 
 `--remote` and the tag default filter both what is walked and what is decorated,
 so a commit shared with an excluded remote doesn't still show that remote's

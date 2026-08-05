@@ -23,8 +23,10 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
 
 
 def run(cmd, cwd=None, capture=True):
@@ -72,6 +74,50 @@ def existing_pr(fork, branch, repo):
     return prs[0]["number"] if prs else None
 
 
+# less quits with the first character of a bound quit action's extra string as
+# its exit status, which is how R gets back here to re-run the walk. Needs less
+# 582 or newer to read the key file as source; on anything older LESSKEYIN is
+# ignored, R keeps its usual repaint meaning and only q works.
+REFRESH_KEY = "R"
+REFRESH_STATUS = ord(REFRESH_KEY)
+LESSKEY = f"#command\n{REFRESH_KEY} quit {REFRESH_KEY}\n"
+
+# -S truncates rather than wraps: a graph row is the graph columns plus the
+# decorations plus the subject, and a wrapped row leaves its continuation
+# without graph columns, so the bars stop lining up. -+F cancels a -F in the
+# caller's $LESS, which would otherwise quit before R could be pressed
+# whenever the graph happened to fit on one screen. -X keeps the graph on
+# screen after the last quit, the way git's pager leaves it.
+LESS = [
+    "less", "-R", "-S", "-+F", "-X",
+    f"-Ps?e(END)  .[{REFRESH_KEY}] refresh   [q] quit",
+]
+
+# -X is also why a refresh has to clear: without the alternate screen less
+# leaves the graph behind when it exits, and the next one paints underneath it.
+CLEAR = "\033[H\033[2J"
+
+
+def page(cmd, repo, env):
+    """Run cmd under less. True if the user asked for another walk."""
+    # ^C is the pager's while it is up, which is what git does for its own
+    # pager too: less takes it as "interrupt the read", and neither we nor the
+    # walk may die on it and leave less drawing over a returned shell prompt.
+    walk = subprocess.Popen(
+        cmd, cwd=repo, stdout=subprocess.PIPE, start_new_session=True
+    )
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        status = subprocess.run(LESS, stdin=walk.stdout, env=env).returncode
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        # Closing our end lets a walk that outlives the pager die of SIGPIPE
+        # instead of blocking on a pipe nobody is reading.
+        walk.stdout.close()
+        walk.wait()
+    return status == REFRESH_STATUS
+
+
 def cmd_log(args):
     cmd = ["git", "log", "--graph", "--oneline", "--decorate"]
     remotes = [r for spec in args.remote or [] for r in spec.split(",") if r]
@@ -92,10 +138,22 @@ def cmd_log(args):
     if args.max_count:
         cmd.append(f"-{args.max_count}")
     cmd += args.git_args
-    # The graph lines are wide; -S truncates instead of wrapping so the graph
-    # stays readable and scrolls sideways.
-    env = {**os.environ, "GIT_PAGER": "less -S"}
-    subprocess.run(cmd, cwd=args.repo, check=False, env=env)
+    if not sys.stdout.isatty():
+        subprocess.run(cmd, cwd=args.repo, check=False)
+        return
+
+    # Paging by hand rather than through git's own pager: the walk has to be
+    # re-run to refresh, and git cannot hand its pager's exit status back.
+    cmd.insert(2, "--color=always")
+    with tempfile.NamedTemporaryFile("w", suffix=".lesskey") as keys:
+        keys.write(LESSKEY)
+        keys.flush()
+        env = {**os.environ, "LESSKEYIN": keys.name}
+        try:
+            while page(cmd, args.repo, env):
+                print(CLEAR, end="", flush=True)
+        except KeyboardInterrupt:
+            pass
 
 
 def cmd_submit(args):
@@ -198,7 +256,8 @@ def build_parser():
     lg = sub.add_parser(
         "log",
         help="git log --graph of the stacks and branches",
-        description="Graph of the repository's commits and where the branches point.",
+        description="Graph of the repository's commits and where the branches point. "
+        "In the pager, R re-runs the walk and q quits.",
     )
     lg.add_argument("--repo", default=".", help="repository directory (default: cwd)")
     lg.add_argument(
