@@ -75,26 +75,20 @@ def existing_pr(fork, branch, repo):
 def cmd_log(args):
     cmd = ["git", "log", "--graph", "--oneline", "--decorate"]
     remotes = [r for spec in args.remote or [] for r in spec.split(",") if r]
-    if remotes or args.no_remotes:
-        # --glob picks what to walk; --decorate-refs keeps the labels in step,
-        # otherwise a commit shared with an excluded remote still shows its name.
-        refs = ["refs/heads/*", "HEAD"]
-        refs += [f"refs/remotes/{r}/*" for r in remotes]
-        cmd += ["--branches", "HEAD"]
-        cmd += [f"--glob=refs/remotes/{r}/*" for r in remotes]
-        if args.tags:
-            refs.append("refs/tags/*")
-            cmd.append("--tags")
-        cmd += [f"--decorate-refs={ref}" for ref in refs]
-    elif args.tags:
-        cmd.append("--all")
-    else:
-        # --exclude only applies to the --all that follows it.
-        cmd += [
-            "--exclude=refs/tags/*",
-            "--all",
-            "--decorate-refs-exclude=refs/tags/*",
-        ]
+    if args.no_remotes:
+        remotes = []
+    elif not remotes:
+        remotes = ["origin"]
+    # --glob picks what to walk; --decorate-refs keeps the labels in step,
+    # otherwise a commit shared with an excluded remote still shows its name.
+    refs = ["refs/heads/*", "HEAD"]
+    refs += [f"refs/remotes/{r}/*" for r in remotes]
+    cmd += ["--branches", "HEAD"]
+    cmd += [f"--glob=refs/remotes/{r}/*" for r in remotes]
+    if args.tags:
+        refs.append("refs/tags/*")
+        cmd.append("--tags")
+    cmd += [f"--decorate-refs={ref}" for ref in refs]
     if args.max_count:
         cmd.append(f"-{args.max_count}")
     cmd += args.git_args
@@ -211,8 +205,8 @@ def build_parser():
         "--remote",
         action="append",
         metavar="NAME",
-        help="show only this remote's refs (repeatable, or comma-separated); "
-        "local branches and HEAD are always shown",
+        help="show only this remote's refs (repeatable, or comma-separated, "
+        "default: origin); local branches and HEAD are always shown",
     )
     lg.add_argument(
         "--no-remotes", action="store_true", help="show no remote refs at all"
