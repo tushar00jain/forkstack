@@ -21,6 +21,7 @@ Subcommands:
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -97,7 +98,10 @@ def cmd_log(args):
     if args.max_count:
         cmd.append(f"-{args.max_count}")
     cmd += args.git_args
-    subprocess.run(cmd, cwd=args.repo, check=False)
+    # The graph lines are wide; -S truncates instead of wrapping so the graph
+    # stays readable and scrolls sideways.
+    env = {**os.environ, "GIT_PAGER": "less -S"}
+    subprocess.run(cmd, cwd=args.repo, check=False, env=env)
 
 
 def cmd_submit(args):
