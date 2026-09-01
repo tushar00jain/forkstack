@@ -28,10 +28,25 @@ forkstack.py --execute                        # push branches, open the PRs
 forkstack.py --base main --prefix feat --execute
 ```
 
-For each commit in `<remote>/<base>..HEAD` it pushes a branch `<prefix>/<n>` to
-your fork and opens a pull request based on the branch below it, so every pull
-request contains exactly one commit. The bottom one targets `<base>`, the branch
-in the fork your stack sits on.
+For each commit in `<remote>/<base>..HEAD` it assigns a stable identity
+`<prefix>/<n>` and opens a pull request containing exactly that commit. A
+`fs-branch` commit trailer keeps the change attached to the same pull
+request when commits are reordered. Its remote refs are
+`fs-head/<prefix>/<n>` and `fs-base/<prefix>/<n>`.
+
+Each pull request targets a private `fs-base/<prefix>/<n>` branch rather
+than the preceding PR branch directly. The base ref points at the exact local
+parent commit and the head ref points at the exact local change commit.
+Forkstack updates every base and head ref together in one atomic,
+force-with-lease push, so GitHub cannot observe a half-restacked branch set.
+
+The first execute pass records stable identities in the local commit messages,
+rewrites the local stack without changing its trees, and creates PRs using the
+new head/base ref namespace. PRs created by older Forkstack versions are left
+untouched and can be closed manually.
+
+After that, amend or reorder normally (for example with `git rebase -i`) and run
+Forkstack again. Keep each commit's `fs-branch` trailer with that change.
 
 | option | meaning |
 | --- | --- |
@@ -67,14 +82,14 @@ name, and a tagged commit off to the side doesn't take up a row in the graph.
 
 ## Notes
 
-- Commits are read straight from the repository, so a Sapling stack works as is
-  (its commits are git commits) and nothing rewrites them.
-- Re-running after an amend force-pushes the branches and updates the existing
-  pull requests rather than opening duplicates.
+- Forkstack rewrites commits only when assigning a new stable identity. It
+  preserves commit trees, authorship, timestamps, and local branch markers.
+- Re-running after an amend or reorder atomically updates the existing pull
+  requests with force-with-lease protection.
 - Bodies are regenerated on every run from the commit message plus a table of
-  the stack, so edits made in the GitHub UI are overwritten. Titles are only set
-  when a pull request is created.
-- `--base` is read through its remote-tracking ref; fetch first if it may be
-  stale.
+  the stack, so edits made in the GitHub UI are overwritten. Titles are updated
+  from commit subjects.
+- Execute mode fetches the selected remote before calculating updates. Dry-run
+  mode uses the existing remote-tracking refs.
 - If a stack gets shorter, branches and pull requests from earlier runs are left
   behind.
