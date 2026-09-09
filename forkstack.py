@@ -243,6 +243,64 @@ def rewrite_with_identities(repo, plan):
     return plan
 
 
+def optional_ref(repo, ref):
+    try:
+        return git(["rev-parse", "--verify", ref], repo)
+    except subprocess.CalledProcessError:
+        return None
+
+
+def checked_out_branches(repo):
+    branches = set()
+    for line in git(["worktree", "list", "--porcelain"], repo).splitlines():
+        if line.startswith("branch "):
+            branches.add(line.removeprefix("branch "))
+    return branches
+
+
+def sync_local_head_branches(repo, plan, remote):
+    """Keep local fs-head branches aligned with their logical stack changes."""
+    checked_out = checked_out_branches(repo)
+    updates = []
+
+    for step in plan:
+        local_ref = f"refs/heads/{step.head_branch}"
+        remote_ref = f"refs/remotes/{remote}/{step.head_branch}"
+        local_rev = optional_ref(repo, local_ref)
+
+        if local_rev == step.rev:
+            continue
+        if local_ref in checked_out:
+            raise RuntimeError(
+                f"cannot update {step.head_branch!r}: it is checked out in a worktree"
+            )
+        if local_rev is None:
+            updates.append(f"create {local_ref} {step.rev}")
+            continue
+
+        remote_rev = optional_ref(repo, remote_ref)
+        if remote_rev != local_rev:
+            raise RuntimeError(
+                f"refusing to overwrite divergent local branch {step.head_branch!r}; "
+                f"it does not match {remote}/{step.head_branch}"
+            )
+        updates.append(f"update {local_ref} {step.rev} {local_rev}")
+
+    if updates:
+        git(["update-ref", "--stdin"], repo, input="\n".join(updates) + "\n")
+
+    for step in plan:
+        git(["config", f"branch.{step.head_branch}.remote", remote], repo)
+        git(
+            [
+                "config",
+                f"branch.{step.head_branch}.merge",
+                f"refs/heads/{step.head_branch}",
+            ],
+            repo,
+        )
+
+
 def push_refs(repo, remote, updates, label):
     if not updates:
         return
@@ -403,6 +461,10 @@ def cmd_submit(args):
                     f"  add {IDENTITY_TRAILER}: {step.branch} to "
                     f"{step.rev[:12]}"
                 )
+            print(
+                f"  create/update local {step.head_branch} tracking "
+                f"{args.remote}/{step.head_branch}"
+            )
             print(f"  atomically update {step.base_branch} and {step.head_branch}")
         print("\nRe-run with --execute to do it.")
         return
@@ -410,6 +472,9 @@ def cmd_submit(args):
     if any(step.identity_added for step in plan):
         print(f"recording stable {IDENTITY_TRAILER} trailers")
         rewrite_with_identities(repo, plan)
+
+    print("updating local PR head branches")
+    sync_local_head_branches(repo, plan, args.remote)
 
     for step in plan:
         step.pr = existing_pr(fork, step.head_branch, repo)

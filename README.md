@@ -40,6 +40,13 @@ parent commit and the head ref points at the exact local change commit.
 Forkstack updates every base and head ref together in one atomic,
 force-with-lease push, so GitHub cannot observe a half-restacked branch set.
 
+Execute mode also creates or updates a matching local `fs-head/<prefix>/<n>`
+branch for every change and configures it to track the fork's remote branch.
+This makes individual stack layers available to branch-based tooling while the
+`fs-branch` trailer keeps each local branch attached to the same logical change
+after amendments or reordering. Forkstack refuses to overwrite a local head
+branch that has diverged from its tracked remote branch.
+
 The first execute pass records stable identities in the local commit messages,
 rewrites the local stack without changing its trees, and creates PRs using the
 new head/base ref namespace. PRs created by older Forkstack versions are left

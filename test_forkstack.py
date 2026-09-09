@@ -108,6 +108,35 @@ class ForkstackTest(unittest.TestCase):
             ["draft/1", "draft/2", "draft/3"],
         )
 
+    def test_refuses_to_overwrite_divergent_local_head_branch(self):
+        git(
+            self.repo,
+            "push",
+            "origin",
+            f"{self.first}:refs/heads/fs-head/draft/1",
+        )
+        git(
+            self.repo,
+            "fetch",
+            "origin",
+            "+refs/heads/*:refs/remotes/origin/*",
+        )
+        git(self.repo, "branch", "fs-head/draft/1", self.second)
+        plan = [
+            forkstack.StackCommit(
+                rev=self.first,
+                branch="draft/1",
+                subject="first change",
+                body="",
+                message="first change",
+            )
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "divergent local branch"):
+            forkstack.sync_local_head_branches(
+                str(self.repo), plan, "origin"
+            )
+
     def test_execute_creates_fresh_prs_then_restacks_them(self):
         prs = {}
         pushes = []
@@ -176,10 +205,24 @@ class ForkstackTest(unittest.TestCase):
             prs["fs-head/draft/2"]["baseRefName"],
             "fs-base/draft/2",
         )
+        first, second = seeded
+        self.assertEqual(
+            git(self.repo, "rev-parse", "fs-head/draft/1"), first
+        )
+        self.assertEqual(
+            git(self.repo, "rev-parse", "fs-head/draft/2"), second
+        )
+        self.assertEqual(
+            git(self.repo, "config", "branch.fs-head/draft/1.remote"),
+            "origin",
+        )
+        self.assertEqual(
+            git(self.repo, "config", "branch.fs-head/draft/1.merge"),
+            "refs/heads/fs-head/draft/1",
+        )
         self.assertEqual(git(self.repo, "rev-parse", "origin/draft/1"), self.first)
         self.assertEqual(git(self.repo, "rev-parse", "origin/draft/2"), self.second)
 
-        first, second = seeded
         git(self.repo, "switch", "--detach", self.base)
         git(self.repo, "cherry-pick", second)
         reordered_second = git(self.repo, "rev-parse", "HEAD")
@@ -212,6 +255,12 @@ class ForkstackTest(unittest.TestCase):
         self.assertEqual(second_head, reordered_second)
         self.assertEqual(first_base, reordered_second)
         self.assertEqual(second_base, self.base)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "fs-head/draft/1"), reordered_first
+        )
+        self.assertEqual(
+            git(self.repo, "rev-parse", "fs-head/draft/2"), reordered_second
+        )
         self.assertEqual(
             git(self.repo, "diff", "--binary", first_base, first_head),
             git(
