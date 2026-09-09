@@ -28,11 +28,14 @@ forkstack.py --execute                        # push branches, open the PRs
 forkstack.py --base main --prefix feat --execute
 ```
 
-For each commit in `<remote>/<base>..HEAD` it assigns a stable identity
-`<prefix>/<n>` and opens a pull request containing exactly that commit. A
-`fs-branch` commit trailer keeps the change attached to the same pull
-request when commits are reordered. Its remote refs are
-`fs-head/<prefix>/<n>` and `fs-base/<prefix>/<n>`.
+For each commit in `<remote>/<base>..HEAD` it preserves an existing stable
+identity or assigns a new `<prefix>/<n>` identity, then opens a pull request
+containing exactly that commit. A `fs-branch` commit trailer keeps the change
+attached to the same pull request when commits are reordered. Existing
+identities are opaque and may be mixed in one stack; `--prefix` only controls
+the names assigned to commits without a trailer and is required when any such
+commits exist. Remote refs are named `fs-head/<identity>` and
+`fs-base/<identity>`.
 
 Each pull request targets a private `fs-base/<prefix>/<n>` branch rather
 than the preceding PR branch directly. The base ref points at the exact local
@@ -40,7 +43,7 @@ parent commit and the head ref points at the exact local change commit.
 Forkstack updates every base and head ref together in one atomic,
 force-with-lease push, so GitHub cannot observe a half-restacked branch set.
 
-Execute mode also creates or updates a matching local `fs-head/<prefix>/<n>`
+Execute mode also creates or updates a matching local `fs-head/<identity>`
 branch for every change and configures it to track the fork's remote branch.
 This makes individual stack layers available to branch-based tooling while the
 `fs-branch` trailer keeps each local branch attached to the same logical change
@@ -60,7 +63,7 @@ Forkstack again. Keep each commit's `fs-branch` trailer with that change.
 | `--repo DIR` | repository to work in (default: cwd) |
 | `--remote NAME` | remote for your fork (default: `origin`) |
 | `--base BRANCH` | branch in the fork the stack sits on (default: `main`) |
-| `--prefix NAME` | branch name prefix, one per stack (default: `stack`) |
+| `--prefix NAME` | identity prefix; required only when the stack has untagged commits |
 | `--no-draft` | open pull requests ready for review instead of as drafts |
 | `--execute` | actually push and create; without it, nothing happens |
 
@@ -93,6 +96,8 @@ name, and a tagged commit off to the side doesn't take up a row in the graph.
   preserves commit trees, authorship, timestamps, and local branch markers.
 - Re-running after an amend or reorder atomically updates the existing pull
   requests with force-with-lease protection.
+- Existing identities from different prefixes can be combined and reordered in
+  one stack. Their branch and pull-request identities remain unchanged.
 - Bodies are regenerated on every run from the commit message plus a table of
   the stack, so edits made in the GitHub UI are overwritten. Titles are updated
   from commit subjects.

@@ -108,6 +108,46 @@ class ForkstackTest(unittest.TestCase):
             ["draft/1", "draft/2", "draft/3"],
         )
 
+    def test_mixed_identities_are_preserved(self):
+        revs = git(
+            self.repo, "rev-list", "--reverse", "origin/main..stack"
+        ).splitlines()
+        plan = forkstack.assign_branches(
+            str(self.repo), revs, "origin", "draft"
+        )
+        git(self.repo, "switch", "stack")
+        forkstack.rewrite_with_identities(str(self.repo), plan)
+        self.commit(
+            "imported.txt",
+            "imported\n",
+            "imported change\n\nfs-branch: other/6",
+        )
+        self.commit("new.txt", "new\n", "new change")
+
+        revs = git(
+            self.repo, "rev-list", "--reverse", "origin/main..HEAD"
+        ).splitlines()
+        updated = forkstack.assign_branches(
+            str(self.repo), revs, "origin", "draft"
+        )
+
+        self.assertEqual(
+            [step.branch for step in updated],
+            ["draft/1", "draft/2", "other/6", "draft/3"],
+        )
+        self.assertEqual(
+            [step.identity_added for step in updated],
+            [False, False, False, True],
+        )
+
+    def test_untagged_commit_requires_prefix(self):
+        revs = git(
+            self.repo, "rev-list", "--reverse", "origin/main..stack"
+        ).splitlines()
+
+        with self.assertRaisesRegex(RuntimeError, "untagged commits require --prefix"):
+            forkstack.assign_branches(str(self.repo), revs, "origin", None)
+
     def test_refuses_to_overwrite_divergent_local_head_branch(self):
         git(
             self.repo,

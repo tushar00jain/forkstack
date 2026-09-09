@@ -124,10 +124,6 @@ def assign_branches(repo, revs, remote, prefix):
         message = commit_field(repo, rev, "%B")
         branch = identity_from_message(message)
         if branch:
-            if not branch.startswith(f"{prefix}/"):
-                raise RuntimeError(
-                    f"commit {rev[:12]} belongs to {branch!r}, not prefix {prefix!r}"
-                )
             if branch in claimed:
                 raise RuntimeError(f"duplicate {IDENTITY_TRAILER}: {branch}")
             try:
@@ -137,13 +133,20 @@ def assign_branches(repo, revs, remote, prefix):
             claimed.add(branch)
         records.append((rev, message, branch))
 
-    known = remote_identities(repo, remote, prefix) | claimed
-    numbered = []
-    branch_re = re.compile(rf"^{re.escape(prefix)}/([0-9]+)$")
-    for branch in known:
-        if match := branch_re.match(branch):
-            numbered.append(int(match.group(1)))
-    next_number = max(numbered, default=0) + 1
+    if prefix is None and any(branch is None for _rev, _message, branch in records):
+        raise RuntimeError("untagged commits require --prefix")
+
+    known = claimed
+    next_number = 1
+    if prefix is not None:
+        known = remote_identities(repo, remote, prefix) | claimed
+        branch_re = re.compile(rf"^{re.escape(prefix)}/([0-9]+)$")
+        numbered = [
+            int(match.group(1))
+            for branch in known
+            if (match := branch_re.match(branch))
+        ]
+        next_number = max(numbered, default=0) + 1
 
     plan = []
     for position, (rev, message, branch) in enumerate(records, start=1):
@@ -592,8 +595,7 @@ def build_parser():
     )
     p.add_argument(
         "--prefix",
-        default="stack",
-        help="branch name prefix, one per stack (default: stack)",
+        help="identity prefix, required only when the stack has untagged commits",
     )
     p.add_argument("--draft", action="store_true", default=True)
     p.add_argument(
