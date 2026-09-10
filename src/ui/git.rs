@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::integrations::{self, CommandRunner, ProcessRunner};
 use crate::ui::model::{Commit, Graph, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
@@ -82,12 +83,28 @@ fn parse_log(log: &str) -> Result<(HashMap<String, Commit>, Vec<String>), String
 }
 
 pub fn load_graph(repo: &Path) -> Result<Graph, String> {
-    run(repo, &["rev-parse", "--git-dir"])?;
-    let head = run(repo, &["rev-parse", "HEAD"])?;
-    let branch = output(repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .ok()
-        .filter(|result| result.status.success())
-        .map(|result| String::from_utf8_lossy(&result.stdout).trim().to_owned());
+    load_graph_with(repo, &ProcessRunner)
+}
+
+fn load_graph_with(repo: &Path, runner: &dyn CommandRunner) -> Result<Graph, String> {
+    let metadata = integrations::git::run(
+        runner,
+        repo,
+        &[
+            "rev-parse",
+            "--absolute-git-dir",
+            "HEAD",
+            "--symbolic-full-name",
+            "HEAD",
+        ],
+    )?;
+    let mut metadata = metadata.lines();
+    let git_dir = PathBuf::from(metadata.next().ok_or("git did not report its directory")?);
+    let head = metadata.next().ok_or("git did not report HEAD")?.to_owned();
+    let branch = metadata
+        .next()
+        .and_then(|name| name.strip_prefix("refs/heads/"))
+        .map(str::to_owned);
 
     let marker_names = [
         ("rebase", "REBASE_HEAD"),
@@ -96,36 +113,35 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
     ];
     let markers: Vec<(String, String)> = marker_names
         .iter()
-        .filter_map(|(kind, name)| verify(repo, name).map(|id| ((*kind).into(), id)))
+        .filter_map(|(kind, name)| {
+            fs::read_to_string(git_dir.join(name))
+                .ok()
+                .and_then(|contents| contents.split_whitespace().next().map(str::to_owned))
+                .map(|id| ((*kind).into(), id))
+        })
         .collect();
-    let files = run(repo, &["diff", "--name-only", "--diff-filter=U"])
+    let files = integrations::git::run(runner, repo, &["diff", "--name-only", "--diff-filter=U"])
         .unwrap_or_default()
         .lines()
         .map(str::to_owned)
         .collect::<Vec<_>>();
 
-    let mut command = Command::new("git");
-    command.current_dir(repo).args([
-        "log",
-        "--branches",
-        "--remotes",
-        "HEAD",
-        "--topo-order",
-        "--format=%H%x1f%P%x1f%s%x1e",
-    ]);
+    let mut args = vec![
+        "log".into(),
+        "--branches".into(),
+        "--remotes".into(),
+        "HEAD".into(),
+        "--topo-order".into(),
+        "--format=%H%x1f%P%x1f%s%x1e".into(),
+    ];
     for (_, id) in &markers {
-        command.arg(id);
+        args.push(id.clone());
     }
-    let result = command
-        .output()
-        .map_err(|error| format!("could not run git: {error}"))?;
-    if !result.status.success() {
-        return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
-    }
-    let log = String::from_utf8_lossy(&result.stdout);
+    let log = integrations::git::run_owned(runner, repo, &args)?;
     let (mut commits, order) = parse_log(&log)?;
 
-    let refs = run(
+    let refs = integrations::git::run(
+        runner,
         repo,
         &[
             "for-each-ref",
@@ -403,27 +419,36 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
     while let Ok(request) = requests.recv() {
         let mut preview = None;
         let mut publish_plan = None;
+        let mut loaded_graph = None;
         let operation = match request {
             Request::Load => None,
             Request::Checkout(id) => checkout(&repo, &id).err(),
             Request::Apply(plan) => apply_move(&repo, &plan).err(),
             Request::PublishPreview(options) => match crate::core::submit::plan(options) {
-                Ok(plan) => {
-                    match load_graph(&repo).and_then(|graph| graph.publish_preview(&plan)) {
-                        Ok(graph) => {
-                            preview = Some(graph);
+                Ok(plan) => match load_graph(&repo) {
+                    Ok(graph) => match graph.publish_preview(&plan) {
+                        Ok(publish_preview) => {
+                            loaded_graph = Some(Ok(graph));
+                            preview = Some(publish_preview);
                             publish_plan = Some(plan);
                             None
                         }
-                        Err(error) => Some(error),
+                        Err(error) => {
+                            loaded_graph = Some(Ok(graph));
+                            Some(error)
+                        }
+                    },
+                    Err(error) => {
+                        loaded_graph = Some(Err(error.clone()));
+                        Some(error)
                     }
-                }
+                },
                 Err(error) => Some(error),
             },
             Request::PublishExecute(plan) => crate::core::submit::execute_checked(&plan).err(),
             Request::Stop => break,
         };
-        let graph = load_graph(&repo);
+        let graph = loaded_graph.unwrap_or_else(|| load_graph(&repo));
         if responses
             .send(Response {
                 graph,
@@ -441,6 +466,36 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct GraphRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl CommandRunner for GraphRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            _repo: &Path,
+            _input: Option<&str>,
+            _env: &BTreeMap<String, String>,
+        ) -> Result<String, String> {
+            assert_eq!(program, "git");
+            self.calls.lock().unwrap().push(args.to_vec());
+            match args.first().map(String::as_str) {
+                Some("rev-parse") => {
+                    Ok("/tmp/forkstack-missing-git-dir\nabc\nrefs/heads/main".into())
+                }
+                Some("diff") => Ok(String::new()),
+                Some("log") => Ok("abc\x1f\x1fsubject\x1e".into()),
+                Some("for-each-ref") => Ok("abc\0refs/heads/main".into()),
+                other => panic!("unexpected Git command: {other:?} {args:?}"),
+            }
+        }
+    }
 
     #[test]
     fn parses_and_reorders_rebase_blocks() {
@@ -448,6 +503,21 @@ mod tests {
         let result = reorder_todo(todo, &["bbbbbbbb".into(), "aaaaaaaa".into()]).unwrap();
         assert!(result.find("pick bbbbbbb").unwrap() < result.find("pick aaaaaaa").unwrap());
         assert!(result.find("refs/heads/a").unwrap() > result.find("pick aaaaaaa").unwrap());
+    }
+
+    #[test]
+    fn graph_load_uses_four_git_processes() {
+        let runner = GraphRunner::default();
+        let graph = load_graph_with(Path::new("."), &runner).unwrap();
+        assert_eq!(graph.head, "abc");
+        assert_eq!(graph.branch.as_deref(), Some("main"));
+        assert_eq!(graph.commits["abc"].local_refs, ["main"]);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4, "unexpected Git commands: {calls:?}");
+        assert_eq!(calls[0][0], "rev-parse");
+        assert_eq!(calls[1][0], "diff");
+        assert_eq!(calls[2][0], "log");
+        assert_eq!(calls[3][0], "for-each-ref");
     }
 
     #[test]

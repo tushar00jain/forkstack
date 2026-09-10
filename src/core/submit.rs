@@ -29,6 +29,7 @@ impl Default for SubmitOptions {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StackCommit {
     pub rev: String,
+    pub parent: String,
     pub branch: String,
     pub subject: String,
     pub body: String,
@@ -61,8 +62,12 @@ pub struct SubmitPlan {
     pub updates: Vec<RefUpdate>,
 }
 
+fn git_with(runner: &dyn CommandRunner, repo: &Path, args: &[&str]) -> Result<String, String> {
+    integrations::git::run(runner, repo, args)
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    integrations::git::run(&ProcessRunner, repo, args)
+    git_with(&ProcessRunner, repo, args)
 }
 
 fn parse_owner_repo(url: &str) -> Option<String> {
@@ -75,6 +80,82 @@ fn parse_owner_repo(url: &str) -> Option<String> {
 
 fn commit_field(repo: &Path, rev: &str, format: &str) -> Result<String, String> {
     git(repo, &["log", "-1", &format!("--format={format}"), rev])
+}
+
+#[derive(Debug)]
+struct CommitRecord {
+    rev: String,
+    parent: String,
+    subject: String,
+    body: String,
+    message: String,
+}
+
+fn parse_commit_records(output: &str) -> Result<Vec<CommitRecord>, String> {
+    let mut records = Vec::new();
+    for record in output.split('\x1e') {
+        let record = record.trim_matches(['\n', '\r']);
+        if record.is_empty() {
+            continue;
+        }
+        let fields: Vec<_> = record.splitn(5, '\x1f').collect();
+        if fields.len() != 5 {
+            return Err("git log returned an unexpected commit record".into());
+        }
+        let parents: Vec<_> = fields[1].split_whitespace().collect();
+        if parents.len() != 1 {
+            return Err(format!(
+                "commit {} has {} parents; forkstack requires a linear stack",
+                &fields[0][..fields[0].len().min(12)],
+                parents.len()
+            ));
+        }
+        records.push(CommitRecord {
+            rev: fields[0].trim().to_owned(),
+            parent: parents[0].to_owned(),
+            subject: fields[2].trim().to_owned(),
+            body: fields[3].trim().to_owned(),
+            message: fields[4].trim().to_owned(),
+        });
+    }
+    for pair in records.windows(2) {
+        if pair[1].parent != pair[0].rev {
+            return Err("forkstack requires a linear stack".into());
+        }
+    }
+    Ok(records)
+}
+
+fn read_commit_range(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    range: &str,
+) -> Result<Vec<CommitRecord>, String> {
+    let format = "--format=%H%x1f%P%x1f%s%x1f%b%x1f%B%x1e";
+    parse_commit_records(&git_with(
+        runner,
+        repo,
+        &["log", "--reverse", format, range],
+    )?)
+}
+
+fn read_commits(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    revs: &[String],
+) -> Result<Vec<CommitRecord>, String> {
+    if revs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let format = "--format=%H%x1f%P%x1f%s%x1f%b%x1f%B%x1e";
+    let mut args = vec![
+        "show".to_owned(),
+        "--no-patch".to_owned(),
+        "--no-walk=unsorted".to_owned(),
+        format.to_owned(),
+    ];
+    args.extend(revs.iter().cloned());
+    parse_commit_records(&integrations::git::run_owned(runner, repo, &args)?)
 }
 
 pub fn identity_from_message(message: &str) -> Result<Option<String>, String> {
@@ -119,9 +200,15 @@ pub fn body_without_identity(body: &str) -> String {
     stripped.trim_end().to_owned()
 }
 
-fn remote_identities(repo: &Path, remote: &str, prefix: &str) -> Result<BTreeSet<String>, String> {
+fn remote_identities(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    remote: &str,
+    prefix: &str,
+) -> Result<BTreeSet<String>, String> {
     let pattern = format!("refs/remotes/{remote}/fs-head/{prefix}/");
-    Ok(git(
+    Ok(git_with(
+        runner,
         repo,
         &["for-each-ref", "--format=%(refname:strip=4)", &pattern],
     )?
@@ -130,51 +217,54 @@ fn remote_identities(repo: &Path, remote: &str, prefix: &str) -> Result<BTreeSet
     .collect())
 }
 
-pub fn assign_branches(
+fn valid_branch_name(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with(['-', '/'])
+        && !branch.ends_with(['/', '.'])
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && !branch.contains("//")
+        && !branch
+            .bytes()
+            .any(|byte| byte < b' ' || byte == 0x7f || b" ~^:?*[\\".contains(&byte))
+        && branch
+            .split('/')
+            .all(|component| !component.starts_with('.') && !component.ends_with(".lock"))
+}
+
+fn assign_records(
+    runner: &dyn CommandRunner,
     repo: &Path,
-    revs: &[String],
+    records: Vec<CommitRecord>,
     remote: &str,
     prefix: Option<&str>,
 ) -> Result<Vec<StackCommit>, String> {
-    let mut records = Vec::new();
     let mut claimed = BTreeSet::new();
-    let mut previous: Option<String> = None;
-    for rev in revs {
-        let parents: Vec<_> = commit_field(repo, rev, "%P")?
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect();
-        if parents.len() != 1 {
-            return Err(format!(
-                "commit {} has {} parents; forkstack requires a linear stack",
-                &rev[..rev.len().min(12)],
-                parents.len()
-            ));
-        }
-        if previous.as_ref().is_some_and(|old| &parents[0] != old) {
-            return Err("forkstack requires a linear stack".into());
-        }
-        previous = Some(rev.clone());
-        let message = commit_field(repo, rev, "%B")?;
-        let branch = identity_from_message(&message)?;
+    let mut parsed = Vec::new();
+    for record in records {
+        let branch = identity_from_message(&record.message)?;
         if let Some(branch) = branch.as_ref() {
             if !claimed.insert(branch.clone()) {
                 return Err(format!("duplicate {IDENTITY_TRAILER}: {branch}"));
             }
-            if git(repo, &["check-ref-format", "--branch", branch]).is_err() {
+            if !valid_branch_name(branch) {
                 return Err(format!("invalid {IDENTITY_TRAILER}: {branch}"));
             }
         }
-        records.push((rev.clone(), message, branch));
+        parsed.push((record, branch));
     }
-    if prefix.is_none() && records.iter().any(|(_, _, branch)| branch.is_none()) {
+    if prefix.is_none() && parsed.iter().any(|(_, branch)| branch.is_none()) {
         return Err("untagged commits require --prefix".into());
     }
 
+    let needs_identity = parsed.iter().any(|(_, branch)| branch.is_none());
     let mut known = claimed.clone();
     let mut next_number = 1_u64;
-    if let Some(prefix) = prefix {
-        known.extend(remote_identities(repo, remote, prefix)?);
+    if let Some(prefix) = prefix.filter(|_| needs_identity) {
+        if !valid_branch_name(prefix) {
+            return Err(format!("invalid identity prefix: {prefix}"));
+        }
+        known.extend(remote_identities(runner, repo, remote, prefix)?);
         next_number = known
             .iter()
             .filter_map(|branch| branch.strip_prefix(&format!("{prefix}/"))?.parse().ok())
@@ -183,7 +273,7 @@ pub fn assign_branches(
             + 1;
     }
     let mut result = Vec::new();
-    for (index, (rev, message, existing)) in records.into_iter().enumerate() {
+    for (index, (record, existing)) in parsed.into_iter().enumerate() {
         let identity_added = existing.is_none();
         let branch = if let Some(branch) = existing {
             branch
@@ -205,19 +295,43 @@ pub fn assign_branches(
             branch
         };
         result.push(StackCommit {
-            subject: commit_field(repo, &rev, "%s")?,
-            body: body_without_identity(&commit_field(repo, &rev, "%b")?),
-            rev,
+            rev: record.rev,
+            parent: record.parent,
             branch,
-            message,
+            subject: record.subject,
+            body: body_without_identity(&record.body),
+            message: record.message,
             identity_added,
         });
     }
     Ok(result)
 }
 
+pub fn assign_branches(
+    repo: &Path,
+    revs: &[String],
+    remote: &str,
+    prefix: Option<&str>,
+) -> Result<Vec<StackCommit>, String> {
+    assign_records(
+        &ProcessRunner,
+        repo,
+        read_commits(&ProcessRunner, repo, revs)?,
+        remote,
+        prefix,
+    )
+}
+
 pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
-    let url = git(&options.repo, &["remote", "get-url", &options.remote])?;
+    plan_with(options, &ProcessRunner)
+}
+
+fn plan_with(options: SubmitOptions, runner: &dyn CommandRunner) -> Result<SubmitPlan, String> {
+    let url = git_with(
+        runner,
+        &options.repo,
+        &["remote", "get-url", &options.remote],
+    )?;
     let fork = parse_owner_repo(&url).ok_or_else(|| {
         format!(
             "could not read owner/name from the {:?} remote URL",
@@ -225,19 +339,14 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
         )
     })?;
     let base_ref = format!("{}/{}", options.remote, options.base);
-    let revs: Vec<String> = git(
-        &options.repo,
-        &["rev-list", "--reverse", &format!("{base_ref}..HEAD")],
-    )?
-    .split_whitespace()
-    .map(str::to_owned)
-    .collect();
-    if revs.is_empty() {
+    let records = read_commit_range(runner, &options.repo, &format!("{base_ref}..HEAD"))?;
+    if records.is_empty() {
         return Err(format!("no commits in {base_ref}..HEAD"));
     }
-    let commits = assign_branches(
+    let commits = assign_records(
+        runner,
         &options.repo,
-        &revs,
+        records,
         &options.remote,
         options.prefix.as_deref(),
     )?;
@@ -248,7 +357,7 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
         commits,
         updates: Vec::new(),
     };
-    refresh_updates(&mut plan)?;
+    refresh_updates(&mut plan);
     Ok(plan)
 }
 
@@ -263,7 +372,7 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
     let mut rewritten = Vec::new();
     for step in &mut plan.commits {
         let old_rev = step.rev.clone();
-        let old_parent = git(repo, &["rev-parse", &format!("{old_rev}^")])?;
+        let old_parent = step.parent.clone();
         let parent = new_parent.clone().unwrap_or_else(|| old_parent.clone());
         let message = add_identity(&step.message, &step.branch)?;
         let new_rev = if parent == old_parent && message == step.message {
@@ -289,12 +398,18 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
             integrations::git::run_input(
                 &ProcessRunner,
                 repo,
-                &["commit-tree".into(), fields[0].into(), "-p".into(), parent],
+                &[
+                    "commit-tree".into(),
+                    fields[0].into(),
+                    "-p".into(),
+                    parent.clone(),
+                ],
                 &format!("{}\n", message.trim_end()),
                 &env,
             )?
         };
         step.rev = new_rev.clone();
+        step.parent = parent;
         step.message = message.clone();
         step.body = body_without_identity(&message.lines().skip(1).collect::<Vec<_>>().join("\n"));
         new_parent = Some(new_rev.clone());
@@ -331,26 +446,22 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
             ],
         )?;
     }
-    refresh_updates(plan)?;
+    refresh_updates(plan);
     Ok(())
 }
 
-fn refresh_updates(plan: &mut SubmitPlan) -> Result<(), String> {
+fn refresh_updates(plan: &mut SubmitPlan) {
     plan.updates.clear();
     for step in &plan.commits {
         plan.updates.push(RefUpdate {
             branch: step.base_branch(),
-            rev: git(
-                &plan.options.repo,
-                &["rev-parse", &format!("{}^", step.rev)],
-            )?,
+            rev: step.parent.clone(),
         });
         plan.updates.push(RefUpdate {
             branch: step.head_branch(),
             rev: step.rev.clone(),
         });
     }
-    Ok(())
 }
 
 fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
@@ -637,6 +748,11 @@ mod tests {
         state: Mutex<FakeState>,
     }
 
+    #[derive(Default)]
+    struct CountingRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
     fn option(args: &[String], name: &str) -> String {
         args.iter()
             .position(|arg| arg == name)
@@ -709,6 +825,20 @@ mod tests {
                 }
                 other => panic!("unexpected gh invocation {other:?}: {args:?}"),
             }
+        }
+    }
+
+    impl CommandRunner for CountingRunner {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            repo: &Path,
+            input: Option<&str>,
+            env: &BTreeMap<String, String>,
+        ) -> Result<String, String> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            ProcessRunner.run(program, args, repo, input, env)
         }
     }
 
@@ -867,6 +997,97 @@ mod tests {
             ["draft/1", "draft/2"]
         );
         assert!(plan.iter().all(|step| step.identity_added));
+    }
+
+    #[test]
+    fn planning_uses_three_git_processes_regardless_of_stack_size() {
+        let fixture = fixture();
+        for index in 0..10 {
+            test_git(
+                &fixture.repo,
+                &[
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    &format!("extra change {index}"),
+                ],
+            );
+        }
+        let runner = CountingRunner::default();
+        let plan = plan_with(
+            SubmitOptions {
+                repo: fixture.repo.clone(),
+                remote: "origin".into(),
+                base: "main".into(),
+                prefix: Some("draft".into()),
+                draft: true,
+            },
+            &runner,
+        )
+        .unwrap();
+        assert_eq!(plan.commits.len(), 12);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 3, "unexpected Git commands: {calls:?}");
+        assert_eq!(calls[0][..2], ["remote", "get-url"]);
+        assert_eq!(calls[1][0], "log");
+        assert_eq!(calls[2][0], "for-each-ref");
+    }
+
+    #[test]
+    fn tagged_stack_planning_uses_two_git_processes_even_with_prefix() {
+        let fixture = fixture();
+        let options = SubmitOptions {
+            repo: fixture.repo.clone(),
+            remote: "origin".into(),
+            base: "main".into(),
+            prefix: Some("unused".into()),
+            draft: true,
+        };
+        let mut initial = plan(options.clone()).unwrap();
+        rewrite_with_identities(&mut initial).unwrap();
+
+        let runner = CountingRunner::default();
+        let plan = plan_with(options, &runner).unwrap();
+        assert!(plan.commits.iter().all(|step| !step.identity_added));
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "unexpected Git commands: {calls:?}");
+        assert_eq!(calls[0][..2], ["remote", "get-url"]);
+        assert_eq!(calls[1][0], "log");
+    }
+
+    #[test]
+    fn in_process_branch_validation_matches_git_rules() {
+        let valid = ["draft/1", "topic", "a.b", "a@b", "a-b", "a_b", "@"];
+        let invalid = [
+            "",
+            "-draft",
+            "/draft",
+            "draft/",
+            "draft.",
+            "draft..x",
+            "draft@{x",
+            "draft//x",
+            ".draft",
+            "draft/.x",
+            "draft/x.lock",
+            "draft lock",
+            "draft~x",
+            "draft^x",
+            "draft:x",
+            "draft?x",
+            "draft*x",
+            "draft[x",
+            "draft\\x",
+        ];
+        for branch in valid.into_iter().chain(invalid) {
+            let git_accepts = Command::new("git")
+                .args(["check-ref-format", "--branch", branch])
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert_eq!(valid_branch_name(branch), git_accepts, "branch: {branch}");
+        }
     }
 
     #[test]
@@ -1083,6 +1304,7 @@ mod tests {
             base_ref: "origin/main".into(),
             commits: vec![StackCommit {
                 rev: fixture.first.clone(),
+                parent: fixture.base.clone(),
                 branch: "draft/1".into(),
                 subject: "first change".into(),
                 body: String::new(),
