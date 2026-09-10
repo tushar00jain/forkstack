@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +46,31 @@ class FixtureRepositoryTest(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "fixture marker is missing"):
                 create_fixture(root, force=True)
+
+    def test_beta_two_conflicts_when_inserted_after_alpha_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = create_fixture(Path(directory) / "fixture")
+            git(repo, "switch", "--detach", "fs-head/beta/3")
+
+            result = subprocess.run(
+                [
+                    "git",
+                    "rebase",
+                    "--update-refs",
+                    "--onto",
+                    "fs-head/alpha/2",
+                    "fs-head/beta/1",
+                ],
+                cwd=repo,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                git(repo, "diff", "--name-only", "--diff-filter=U"),
+                "shared.txt",
+            )
 
 
 if __name__ == "__main__":

@@ -10,7 +10,9 @@ The generated graph is:
 
 Each stack commit has an ``fs-branch`` trailer plus matching local and remote
 ``fs-head`` refs. Remote ``fs-base`` refs reproduce the layout made by
-``forkstack submit --execute``.
+``forkstack submit --execute``. ``main-3`` creates ``shared.txt``; ``alpha-2``
+and ``beta-2`` make conflicting edits to it so inserting the beta substack
+after ``alpha-2`` demonstrates the UI's conflict state.
 """
 
 from __future__ import annotations
@@ -85,12 +87,13 @@ def fixture_stream() -> bytes:
 
     parent = None
     for mark in range(1, 7):
+        filename = "shared.txt" if mark == 3 else f"main-{mark}.txt"
         _append_commit(
             stream,
             ref="main",
             mark=mark,
             parent=parent,
-            filename=f"main-{mark}.txt",
+            filename=filename,
             subject=f"Main change {mark}",
         )
         parent = mark
@@ -105,12 +108,17 @@ def fixture_stream() -> bytes:
         for number in range(1, 4):
             mark = first_mark + number - 1
             identity = f"{name}/{number}"
+            filename = (
+                "shared.txt"
+                if name in {"alpha", "beta"} and number == 2
+                else f"{name}-{number}.txt"
+            )
             _append_commit(
                 stream,
                 ref=f"fs-head/{identity}",
                 mark=mark,
                 parent=parent,
-                filename=f"{name}-{number}.txt",
+                filename=filename,
                 subject=f"{name.title()} change {number}",
                 identity=identity,
             )

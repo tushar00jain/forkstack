@@ -44,6 +44,9 @@ pub struct MovePlan {
     pub detach_for_rewrite: bool,
     /// Local branch to check out at the resulting stack tip.
     pub checkout_branch: String,
+    /// Local refs that should follow each logical commit during an explicit
+    /// substack insertion rebase. Entries are `(commit, branch)`.
+    pub ref_updates: Vec<(String, String)>,
     /// Old commit ids, in the order the rebase will replay them.
     pub commits: Vec<String>,
 }
@@ -222,6 +225,7 @@ impl Graph {
             let resulting_tip_commit = commits.last().cloned().ok_or("move has no commits")?;
             let checkout_branch =
                 self.checkout_branch(&commits, &resulting_tip, detach_for_rewrite)?;
+            let ref_updates = self.ref_updates(&commits);
             return Ok(MovePlan {
                 selected: selected.into(),
                 destination: destination.into(),
@@ -233,6 +237,7 @@ impl Graph {
                 tip_commit: resulting_tip_commit,
                 detach_for_rewrite,
                 checkout_branch,
+                ref_updates,
                 commits,
             });
         }
@@ -263,6 +268,7 @@ impl Graph {
             return Err("that move would not change the stack".into());
         }
         let checkout_branch = self.checkout_branch(&commits, &tip, detach_for_rewrite)?;
+        let ref_updates = self.ref_updates(&commits);
         Ok(MovePlan {
             selected: selected.into(),
             destination: destination.into(),
@@ -274,8 +280,25 @@ impl Graph {
             tip_commit,
             detach_for_rewrite,
             checkout_branch,
+            ref_updates,
             commits,
         })
+    }
+
+    fn ref_updates(&self, commits: &[String]) -> Vec<(String, String)> {
+        let mut updates = Vec::new();
+        for id in commits {
+            if let Some(commit) = self.commits.get(id) {
+                updates.extend(
+                    commit
+                        .local_refs
+                        .iter()
+                        .map(|branch| (id.clone(), branch.clone())),
+                );
+            }
+        }
+        updates.sort();
+        updates
     }
 
     fn checkout_branch(

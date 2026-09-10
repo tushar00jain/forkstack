@@ -162,8 +162,11 @@ The fixture lives in `/tmp` so Git operations do not pay the metadata latency
 of a network-mounted working tree. `alpha` branches after the third commit on
 `main`; `main` then advances by three commits and `beta` branches there. Both
 stacks contain three commits, and a third three-commit stack named `gamma` sits
-on top of `alpha`. Re-run the script with `--force` to reset it. The script
-prints the exact UI command for the current machine.
+on top of `alpha`. To see conflict rendering, check out `beta/3`, pick up the
+substack at `beta/2` with `s`, preview it after `alpha/2`, and apply with `a`.
+The conflicting `shared.txt` edits in `beta/2` and `alpha/2` stop the rebase so
+the incoming and local commits appear in red. Re-run the script with `--force`
+to reset it. The script prints the exact UI command for the current machine.
 
 ## Notes
 

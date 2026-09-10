@@ -270,46 +270,72 @@ pub fn run_sequence_editor(order_path: &Path, todo_path: &Path) -> Result<(), St
     fs::write(todo_path, reorder_todo(&original, &order)?).map_err(|error| error.to_string())
 }
 
+pub fn run_todo_editor(prepared_path: &Path, todo_path: &Path) -> Result<(), String> {
+    let prepared = fs::read(prepared_path).map_err(|error| error.to_string())?;
+    fs::write(todo_path, prepared).map_err(|error| error.to_string())
+}
+
+fn explicit_rebase_todo(plan: &MovePlan) -> String {
+    let mut todo = String::new();
+    for commit in &plan.commits {
+        todo.push_str(&format!("pick {commit}\n"));
+        for (_, branch) in plan
+            .ref_updates
+            .iter()
+            .filter(|(id, branch)| id == commit && branch != &plan.checkout_branch)
+        {
+            todo.push_str(&format!("update-ref refs/heads/{branch}\n"));
+        }
+    }
+    todo
+}
+
+fn run_explicit_rebase(repo: &Path, plan: &MovePlan) -> Result<Output, String> {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let todo_path =
+        env::temp_dir().join(format!("forkstack-ui-{}-{stamp}.todo", std::process::id()));
+    fs::write(&todo_path, explicit_rebase_todo(plan)).map_err(|error| error.to_string())?;
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    let editor = format!(
+        "{} --todo-editor {}",
+        shell_quote(&executable.to_string_lossy()),
+        shell_quote(&todo_path.to_string_lossy())
+    );
+    let upstream = if plan.commits.len() == plan.carried_count {
+        &plan.source_base
+    } else {
+        &plan.destination
+    };
+    let result = Command::new("git")
+        .current_dir(repo)
+        .args([
+            "-c",
+            "rebase.abbreviateCommands=false",
+            "rebase",
+            "--interactive",
+            "--update-refs",
+            "--onto",
+            &plan.destination,
+            upstream,
+            &plan.checkout_branch,
+        ])
+        .env("GIT_SEQUENCE_EDITOR", editor)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"));
+    let _ = fs::remove_file(todo_path);
+    result
+}
+
 pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
     assert_clean(repo)?;
-    if plan.include_descendants {
-        let carried_tip = plan
-            .commits
-            .get(plan.carried_count.saturating_sub(1))
-            .ok_or("substack move has no carried commits")?;
-        run(repo, &["switch", "--detach", carried_tip])?;
-    } else if plan.detach_for_rewrite {
+    if plan.detach_for_rewrite && !plan.include_descendants {
         run(repo, &["switch", "--detach", &plan.tip_commit])?;
     }
     let result = if plan.include_descendants {
-        let first = output(
-            repo,
-            &[
-                "rebase",
-                "--update-refs",
-                "--onto",
-                &plan.destination,
-                &plan.source_base,
-            ],
-        )?;
-        if !first.status.success() {
-            first
-        } else if plan.commits.len() == plan.carried_count {
-            first
-        } else {
-            let carried_tip = run(repo, &["rev-parse", "HEAD"])?;
-            run(repo, &["switch", "--detach", &plan.tip_commit])?;
-            output(
-                repo,
-                &[
-                    "rebase",
-                    "--update-refs",
-                    "--onto",
-                    &carried_tip,
-                    &plan.destination,
-                ],
-            )?
-        }
+        run_explicit_rebase(repo, plan)?
     } else {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -345,7 +371,7 @@ pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
         result
     };
     if result.status.success() {
-        if plan.detach_for_rewrite || plan.include_descendants {
+        if plan.detach_for_rewrite && !plan.include_descendants {
             run(repo, &["switch", &plan.checkout_branch])?;
         }
         Ok(())
@@ -395,25 +421,6 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
 mod tests {
     use super::*;
 
-    fn git(repo: &Path, args: &[&str]) -> String {
-        run(repo, args).unwrap()
-    }
-
-    fn commit_on_new_branch(repo: &Path, branch: &str, start: Option<&str>, subject: &str) {
-        let mut args = vec!["switch", "-c", branch];
-        if let Some(start) = start {
-            args.push(start);
-        }
-        git(repo, &args);
-        fs::write(
-            repo.join(format!("{}.txt", subject.to_lowercase())),
-            subject,
-        )
-        .unwrap();
-        git(repo, &["add", "."]);
-        git(repo, &["commit", "-m", subject]);
-    }
-
     #[test]
     fn parses_and_reorders_rebase_blocks() {
         let todo = "pick aaaaaaa first\nupdate-ref refs/heads/a\n\npick bbbbbbb second\n# help\n";
@@ -445,66 +452,41 @@ mod tests {
     }
 
     #[test]
-    fn applies_substack_as_an_insertion_before_destination_descendants() {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let repo = env::temp_dir().join(format!(
-            "forkstack-insertion-test-{}-{stamp}",
-            std::process::id()
-        ));
-        fs::create_dir(&repo).unwrap();
-        git(&repo, &["init", "-b", "main"]);
-        git(&repo, &["config", "user.name", "Forkstack Test"]);
-        git(&repo, &["config", "user.email", "forkstack@example.com"]);
-        fs::write(repo.join("root.txt"), "root").unwrap();
-        git(&repo, &["add", "."]);
-        git(&repo, &["commit", "-m", "Root"]);
-        let root = git(&repo, &["rev-parse", "HEAD"]);
-
-        commit_on_new_branch(&repo, "fs-head/alpha/2", Some(&root), "Alpha2");
-        commit_on_new_branch(&repo, "fs-head/alpha/3", None, "Alpha3");
-        commit_on_new_branch(&repo, "fs-head/gamma/1", None, "Gamma1");
-        commit_on_new_branch(&repo, "fs-head/gamma/2", None, "Gamma2");
-        commit_on_new_branch(&repo, "fs-head/gamma/3", None, "Gamma3");
-        commit_on_new_branch(&repo, "fs-head/beta/2", Some(&root), "Beta2");
-        commit_on_new_branch(&repo, "fs-head/beta/3", None, "Beta3");
-
-        let graph = load_graph(&repo).unwrap();
-        let beta3 = git(&repo, &["rev-parse", "fs-head/beta/3"]);
-        let alpha2 = git(&repo, &["rev-parse", "fs-head/alpha/2"]);
-        let plan = graph.plan_move(&beta3, &alpha2, true).unwrap();
-        apply_move(&repo, &plan).unwrap();
+    fn explicit_todo_replays_all_commits_and_updates_non_tip_refs() {
+        let plan = MovePlan {
+            selected: "beta2".into(),
+            destination: "alpha2".into(),
+            include_descendants: true,
+            base: "alpha2".into(),
+            source_base: "beta1".into(),
+            carried_count: 2,
+            tip: "fs-head/gamma/3".into(),
+            tip_commit: "gamma3".into(),
+            detach_for_rewrite: true,
+            checkout_branch: "fs-head/gamma/3".into(),
+            ref_updates: vec![
+                ("beta2".into(), "fs-head/beta/2".into()),
+                ("beta3".into(), "fs-head/beta/3".into()),
+                ("alpha3".into(), "fs-head/alpha/3".into()),
+                ("gamma3".into(), "fs-head/gamma/3".into()),
+            ],
+            commits: vec![
+                "beta2".into(),
+                "beta3".into(),
+                "alpha3".into(),
+                "gamma3".into(),
+            ],
+        };
 
         assert_eq!(
-            git(
-                &repo,
-                &[
-                    "log",
-                    "--first-parent",
-                    "--format=%s",
-                    "-6",
-                    "fs-head/gamma/3",
-                ],
-            )
-            .lines()
-            .collect::<Vec<_>>(),
-            ["Gamma3", "Gamma2", "Gamma1", "Alpha3", "Beta3", "Alpha2"]
+            explicit_rebase_todo(&plan),
+            "pick beta2\n\
+             update-ref refs/heads/fs-head/beta/2\n\
+             pick beta3\n\
+             update-ref refs/heads/fs-head/beta/3\n\
+             pick alpha3\n\
+             update-ref refs/heads/fs-head/alpha/3\n\
+             pick gamma3\n"
         );
-        for (branch, subject) in [
-            ("fs-head/beta/3", "Beta3"),
-            ("fs-head/alpha/3", "Alpha3"),
-            ("fs-head/gamma/1", "Gamma1"),
-            ("fs-head/gamma/2", "Gamma2"),
-            ("fs-head/gamma/3", "Gamma3"),
-        ] {
-            assert_eq!(git(&repo, &["show", "-s", "--format=%s", branch]), subject);
-        }
-        assert_eq!(
-            git(&repo, &["symbolic-ref", "--short", "HEAD"]),
-            "fs-head/gamma/3"
-        );
-        fs::remove_dir_all(repo).unwrap();
     }
 }

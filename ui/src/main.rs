@@ -25,6 +25,17 @@ fn main() {
         }
         return;
     }
+    if args.first().map(String::as_str) == Some("--todo-editor") {
+        if args.len() != 3 {
+            usage();
+        }
+        if let Err(error) = git::run_todo_editor(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]))
+        {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!("forkstack-ui [--repo PATH]\n\nA local-only Git stack graph and history editor.");
         return;
