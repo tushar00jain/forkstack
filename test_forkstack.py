@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import forkstack
+from forkstack.commands import submit as forkstack
 
 
 def git(repo, *args, input=None):

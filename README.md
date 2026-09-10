@@ -23,9 +23,9 @@ want a stack reviewable somewhere before anything goes upstream.
 Check out the top of the stack, then:
 
 ```
-forkstack.py                                  # dry run: print the plan
-forkstack.py --execute                        # push branches, open the PRs
-forkstack.py --base main --prefix feat --execute
+forkstack.py submit                                  # dry run: print the plan
+forkstack.py submit --execute                        # push branches, open the PRs
+forkstack.py submit --base main --prefix feat --execute
 ```
 
 For each commit in `<remote>/<base>..HEAD` it preserves an existing stable
