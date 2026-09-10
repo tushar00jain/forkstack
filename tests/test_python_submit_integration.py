@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -9,6 +10,9 @@ from pathlib import Path
 from unittest import mock
 
 from forkstack.commands import submit as forkstack
+
+
+INTEGRATION_OUTPUT = Path(__file__).resolve().parents[1] / "target" / "integration-fixtures"
 
 
 def git(repo, *args, input=None):
@@ -22,10 +26,13 @@ def git(repo, *args, input=None):
     ).stdout.strip()
 
 
-class ForkstackTest(unittest.TestCase):
+class PythonSubmitIntegrationTest(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        root = Path(self.temp.name)
+        INTEGRATION_OUTPUT.mkdir(parents=True, exist_ok=True)
+        root = Path(
+            tempfile.mkdtemp(prefix="python-submit-", dir=INTEGRATION_OUTPUT)
+        )
+        self.root = root
         self.repo = root / "repo"
         self.remote = root / "remote.git"
         git(root, "init", "--bare", str(self.remote))
@@ -50,7 +57,7 @@ class ForkstackTest(unittest.TestCase):
         )
 
     def tearDown(self):
-        self.temp.cleanup()
+        shutil.rmtree(self.root, ignore_errors=True)
 
     def commit(self, name, contents, message):
         (self.repo / name).write_text(contents)

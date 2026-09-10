@@ -18,15 +18,13 @@ after ``alpha-2`` demonstrates the UI's conflict state.
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 
 MARKER = ".forkstack-fixture"
-DEFAULT_FIXTURE = Path(tempfile.gettempdir()) / f"forkstack-fixture-{os.getuid()}"
+DEFAULT_FIXTURE = Path(__file__).resolve().parents[1] / "fixture"
 
 
 def git(repo: Path, *args: str, input: str | None = None) -> str:

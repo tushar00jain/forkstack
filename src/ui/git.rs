@@ -83,10 +83,14 @@ fn parse_log(log: &str) -> Result<(HashMap<String, Commit>, Vec<String>), String
 }
 
 pub fn load_graph(repo: &Path) -> Result<Graph, String> {
-    load_graph_with(repo, &ProcessRunner)
+    load_graph_with(repo, &ProcessRunner, &|path| fs::read_to_string(path).ok())
 }
 
-fn load_graph_with(repo: &Path, runner: &dyn CommandRunner) -> Result<Graph, String> {
+fn load_graph_with(
+    repo: &Path,
+    runner: &dyn CommandRunner,
+    read_marker: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Graph, String> {
     let metadata = integrations::git::run(
         runner,
         repo,
@@ -114,8 +118,7 @@ fn load_graph_with(repo: &Path, runner: &dyn CommandRunner) -> Result<Graph, Str
     let markers: Vec<(String, String)> = marker_names
         .iter()
         .filter_map(|(kind, name)| {
-            fs::read_to_string(git_dir.join(name))
-                .ok()
+            read_marker(&git_dir.join(name))
                 .and_then(|contents| contents.split_whitespace().next().map(str::to_owned))
                 .map(|id| ((*kind).into(), id))
         })
@@ -486,9 +489,7 @@ mod tests {
             assert_eq!(program, "git");
             self.calls.lock().unwrap().push(args.to_vec());
             match args.first().map(String::as_str) {
-                Some("rev-parse") => {
-                    Ok("/tmp/forkstack-missing-git-dir\nabc\nrefs/heads/main".into())
-                }
+                Some("rev-parse") => Ok("unused-git-dir\nabc\nrefs/heads/main".into()),
                 Some("diff") => Ok(String::new()),
                 Some("log") => Ok("abc\x1f\x1fsubject\x1e".into()),
                 Some("for-each-ref") => Ok("abc\0refs/heads/main".into()),
@@ -508,7 +509,7 @@ mod tests {
     #[test]
     fn graph_load_uses_four_git_processes() {
         let runner = GraphRunner::default();
-        let graph = load_graph_with(Path::new("."), &runner).unwrap();
+        let graph = load_graph_with(Path::new("."), &runner, &|_| None).unwrap();
         assert_eq!(graph.head, "abc");
         assert_eq!(graph.branch.as_deref(), Some("main"));
         assert_eq!(graph.commits["abc"].local_refs, ["main"]);

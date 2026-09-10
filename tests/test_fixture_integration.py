@@ -1,17 +1,32 @@
-"""Tests for the disposable Forkstack fixture generator."""
+"""Real-system integration tests for the disposable fixture generator."""
 
 import subprocess
+import shutil
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 
 from scripts.create_fixture_repo import create_fixture, git
 
 
-class FixtureRepositoryTest(unittest.TestCase):
+INTEGRATION_OUTPUT = Path(__file__).resolve().parents[1] / "target" / "integration-fixtures"
+
+
+@contextmanager
+def integration_directory(prefix):
+    INTEGRATION_OUTPUT.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix=prefix, dir=INTEGRATION_OUTPUT))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+class FixtureRepositoryIntegrationTest(unittest.TestCase):
     def test_creates_expected_three_commit_stacks(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = create_fixture(Path(directory) / "fixture")
+        with integration_directory("fixture-graph-") as directory:
+            repo = create_fixture(directory / "fixture")
 
             self.assertEqual(git(repo, "rev-list", "--count", "main"), "6")
             self.assertEqual(
@@ -42,16 +57,16 @@ class FixtureRepositoryTest(unittest.TestCase):
             )
 
     def test_force_only_removes_a_generated_fixture(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory) / "not-a-fixture"
+        with integration_directory("fixture-safety-") as directory:
+            root = directory / "not-a-fixture"
             root.mkdir()
 
             with self.assertRaisesRegex(RuntimeError, "fixture marker is missing"):
                 create_fixture(root, force=True)
 
     def test_beta_two_conflicts_when_inserted_after_alpha_two(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = create_fixture(Path(directory) / "fixture")
+        with integration_directory("fixture-conflict-") as directory:
+            repo = create_fixture(directory / "fixture")
             git(repo, "switch", "--detach", "fs-head/beta/3")
 
             result = subprocess.run(
@@ -64,8 +79,8 @@ class FixtureRepositoryTest(unittest.TestCase):
                     "fs-head/beta/1",
                 ],
                 cwd=repo,
-                text=True,
                 capture_output=True,
+                text=True,
             )
 
             self.assertNotEqual(result.returncode, 0)

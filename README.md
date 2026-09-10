@@ -48,7 +48,7 @@ forkstack log --no-remotes -n 20
 
 ```sh
 python3 scripts/create_fixture_repo.py --force
-cargo run -- ui --repo "/tmp/forkstack-fixture-$(id -u)/repo"
+cargo run -- ui --repo fixture/repo
 ```
 
 Moving the `beta/2` substack after `alpha/2` intentionally conflicts in
@@ -63,3 +63,19 @@ updates the complete ref set atomically.
 
 The CLI and UI share the same Rust planner and executor. Previews are in-memory;
 completed operations are always reloaded from Git.
+
+## Tests
+
+Hermetic Rust unit tests do not invoke Git or create repositories:
+
+```sh
+cargo test --lib
+```
+
+Real-system tests are opt-in and run separately:
+
+```sh
+cargo test --features integration-tests --test submit_integration
+python3 -m unittest tests/test_fixture_integration.py
+python3 -m unittest tests/test_python_submit_integration.py
+```
