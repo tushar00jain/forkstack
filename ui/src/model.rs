@@ -148,6 +148,12 @@ impl Graph {
         }
     }
 
+    pub fn carried_substack(&self, selected: &str) -> Result<Vec<String>, String> {
+        let (_, tip_commit, _) = self.stack_tip(selected)?;
+        let parent = self.first_parent(selected)?;
+        self.linear_segment(&parent, &tip_commit)
+    }
+
     fn descendant_stack_tip(&self, destination: &str) -> Result<(String, String), String> {
         let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
         for commit in self.commits.values() {
@@ -627,6 +633,7 @@ mod tests {
     #[test]
     fn substack_insertion_replays_destination_descendants_above_carried_commits() {
         let graph = insertion_graph();
+        assert_eq!(graph.carried_substack("beta2").unwrap(), ["beta2", "beta3"]);
         let plan = graph.plan_move("beta3", "alpha2", true).unwrap();
 
         assert_eq!(plan.base, "alpha2");

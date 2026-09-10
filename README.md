@@ -129,7 +129,7 @@ commits; local refs follow them and `origin/*` refs remain on real commits.
 | `Up` / `Down` | select a commit |
 | `Enter` | check out the selected commit, or preview a pending move |
 | `Space` | pick up one commit |
-| `s` or `Shift+Space` | pick up the commit and the linear substack above it |
+| `s` or `Shift+Space` | pick up and highlight the commit and linear substack above it |
 | `a` | apply the previewed move |
 | `Esc` | cancel a move |
 | `/`, `n`, `N` | search, next match, previous match |

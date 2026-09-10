@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -40,6 +41,7 @@ pub struct App {
     preview: Option<Graph>,
     selected: Option<String>,
     carried: Option<String>,
+    carried_commits: HashSet<String>,
     carry_substack: bool,
     pending: Option<MovePlan>,
     search: Search,
@@ -64,6 +66,7 @@ impl App {
             preview: None,
             selected: None,
             carried: None,
+            carried_commits: HashSet::new(),
             carry_substack: false,
             pending: None,
             search: Search::default(),
@@ -101,6 +104,7 @@ impl App {
         self.pending = None;
         if !keep_carried {
             self.carried = None;
+            self.carried_commits.clear();
         }
         if had_preview {
             self.update_rendered();
@@ -123,8 +127,28 @@ impl App {
     }
 
     fn pick(&mut self, substack: bool) {
+        let Some(selected) = self.selected.clone() else {
+            return;
+        };
+        let commits = if substack {
+            let Some(graph) = self.graph.as_ref() else {
+                return;
+            };
+            match graph.carried_substack(&selected) {
+                Ok(commits) => commits,
+                Err(error) => {
+                    self.clear_preview(false);
+                    self.status = Some(error);
+                    self.status_error = true;
+                    return;
+                }
+            }
+        } else {
+            vec![selected.clone()]
+        };
         self.clear_preview(false);
-        self.carried = self.selected.clone();
+        self.carried = Some(selected);
+        self.carried_commits = commits.into_iter().collect();
         self.carry_substack = substack;
         self.status = None;
         self.status_error = false;
@@ -298,6 +322,7 @@ impl App {
                     self.preview = None;
                     if mutation {
                         self.carried = None;
+                        self.carried_commits.clear();
                         self.pending = None;
                     }
                     let ids = self.graph_ids();
@@ -320,7 +345,7 @@ impl App {
     fn draw(&mut self, terminal: &mut Tui) -> io::Result<()> {
         let rendered = self.rendered.clone();
         let selected = self.selected.clone();
-        let carried = self.carried.clone();
+        let carried_commits = self.carried_commits.clone();
         let status_error = self.status_error;
         terminal.draw(|frame| {
             let [graph_area, message_area, footer_area] = Layout::vertical([
@@ -351,7 +376,11 @@ impl App {
                     if line.conflict {
                         style = style.fg(Color::Red).add_modifier(Modifier::BOLD);
                     }
-                    if line.commit.as_ref() == carried.as_ref() {
+                    if line
+                        .commit
+                        .as_ref()
+                        .is_some_and(|id| carried_commits.contains(id))
+                    {
                         style = style.fg(Color::Yellow);
                     }
                     if line.commit.as_ref() == selected.as_ref() {
