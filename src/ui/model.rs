@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::core::submit::SubmitPlan;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Commit {
     pub id: String,
@@ -52,6 +54,44 @@ pub struct MovePlan {
 }
 
 impl Graph {
+    pub fn publish_preview(&self, plan: &SubmitPlan) -> Result<Self, String> {
+        let mut graph = self.clone();
+        let local_heads: HashSet<_> = plan
+            .updates
+            .iter()
+            .filter(|update| update.branch.starts_with("fs-head/"))
+            .map(|update| update.branch.clone())
+            .collect();
+        let remote_refs: HashSet<_> = plan
+            .updates
+            .iter()
+            .map(|update| format!("{}/{}", plan.options.remote, update.branch))
+            .collect();
+        for commit in graph.commits.values_mut() {
+            commit.local_refs.retain(|name| !local_heads.contains(name));
+            commit
+                .remote_refs
+                .retain(|name| !remote_refs.contains(name));
+        }
+        for update in &plan.updates {
+            let commit = graph.commits.get_mut(&update.rev).ok_or_else(|| {
+                format!("publish target {} is not visible in the graph", update.rev)
+            })?;
+            commit.preview = true;
+            let local = update.branch.clone();
+            let remote = format!("{}/{}", plan.options.remote, update.branch);
+            if update.branch.starts_with("fs-head/") && !commit.local_refs.contains(&local) {
+                commit.local_refs.push(local);
+            }
+            if !commit.remote_refs.contains(&remote) {
+                commit.remote_refs.push(remote);
+            }
+            commit.local_refs.sort();
+            commit.remote_refs.sort();
+        }
+        Ok(graph)
+    }
+
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
         let mut pending = vec![descendant.to_owned()];
         let mut seen = HashSet::new();
@@ -521,6 +561,81 @@ mod tests {
         assert_eq!(
             preview.commits["preview:b"].parents,
             vec!["preview:c".to_owned()]
+        );
+    }
+
+    #[test]
+    fn publish_preview_decorates_head_and_base_targets() {
+        let mut graph = graph();
+        graph
+            .commits
+            .get_mut("c")
+            .unwrap()
+            .local_refs
+            .push("fs-head/test/1".into());
+        graph
+            .commits
+            .get_mut("c")
+            .unwrap()
+            .remote_refs
+            .push("origin/fs-head/test/1".into());
+        graph
+            .commits
+            .get_mut("d")
+            .unwrap()
+            .remote_refs
+            .push("origin/fs-base/test/1".into());
+        let plan = SubmitPlan {
+            options: crate::core::submit::SubmitOptions {
+                remote: "origin".into(),
+                ..crate::core::submit::SubmitOptions::default()
+            },
+            fork: "example/repo".into(),
+            base_ref: "origin/main".into(),
+            root: "a".into(),
+            commits: Vec::new(),
+            updates: vec![
+                crate::core::submit::RefUpdate {
+                    branch: "fs-base/test/1".into(),
+                    rev: "a".into(),
+                },
+                crate::core::submit::RefUpdate {
+                    branch: "fs-head/test/1".into(),
+                    rev: "b".into(),
+                },
+            ],
+        };
+        let preview = graph.publish_preview(&plan).unwrap();
+        assert!(
+            preview.commits["a"]
+                .remote_refs
+                .contains(&"origin/fs-base/test/1".into())
+        );
+        assert!(
+            preview.commits["b"]
+                .remote_refs
+                .contains(&"origin/fs-head/test/1".into())
+        );
+        assert!(
+            preview.commits["b"]
+                .local_refs
+                .contains(&"fs-head/test/1".into())
+        );
+        assert!(preview.commits["a"].preview && preview.commits["b"].preview);
+        assert!(
+            !preview.commits["c"]
+                .local_refs
+                .contains(&"fs-head/test/1".into())
+        );
+        assert!(
+            !preview.commits["c"]
+                .remote_refs
+                .contains(&"origin/fs-head/test/1".into())
+        );
+        assert!(
+            !preview.commits["d"]
+                .remote_refs
+                .contains(&"origin/fs-base/test/1".into())
         );
     }
 

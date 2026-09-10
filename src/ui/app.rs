@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
@@ -17,9 +16,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::git::{Request, Response, worker};
-use crate::model::{Graph, MovePlan};
-use crate::render::{RenderedLine, commit_label, render_graph};
+use crate::core::submit::{SubmitOptions, SubmitPlan};
+use crate::ui::git::{Request, Response, worker};
+use crate::ui::model::{Graph, MovePlan};
+use crate::ui::render::{RenderedLine, commit_label, render_graph};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -36,6 +36,18 @@ struct Search {
     matches: Vec<String>,
 }
 
+fn move_pick(key: &KeyEvent) -> Option<bool> {
+    match key.code {
+        KeyCode::Char('m') => Some(false),
+        KeyCode::Char('M') => Some(true),
+        _ => None,
+    }
+}
+
+fn preserve_preview_while_navigating(publish_active: bool) -> bool {
+    publish_active
+}
+
 pub struct App {
     graph: Option<Graph>,
     preview: Option<Graph>,
@@ -44,6 +56,8 @@ pub struct App {
     carried_commits: HashSet<String>,
     carry_substack: bool,
     pending: Option<MovePlan>,
+    publish_options: SubmitOptions,
+    publish_plan: Option<SubmitPlan>,
     search: Search,
     status: Option<String>,
     status_error: bool,
@@ -57,7 +71,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(repo: PathBuf) -> Self {
+    pub fn new(publish_options: SubmitOptions) -> Self {
+        let repo = publish_options.repo.clone();
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
         thread::spawn(move || worker(repo, request_rx, response_tx));
@@ -69,6 +84,8 @@ impl App {
             carried_commits: HashSet::new(),
             carry_substack: false,
             pending: None,
+            publish_options,
+            publish_plan: None,
             search: Search::default(),
             status: None,
             status_error: false,
@@ -102,6 +119,7 @@ impl App {
     fn clear_preview(&mut self, keep_carried: bool) {
         let had_preview = self.preview.take().is_some();
         self.pending = None;
+        self.publish_plan = None;
         if !keep_carried {
             self.carried = None;
             self.carried_commits.clear();
@@ -112,7 +130,9 @@ impl App {
     }
 
     fn move_cursor(&mut self, amount: isize) {
-        self.clear_preview(true);
+        if !preserve_preview_while_navigating(self.publish_plan.is_some()) {
+            self.clear_preview(true);
+        }
         let ids = self.graph_ids();
         if ids.is_empty() {
             return;
@@ -215,6 +235,38 @@ impl App {
         let _ = self.requests.send(Request::Load);
     }
 
+    fn preview_publish(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.clear_preview(false);
+        if self
+            .requests
+            .send(Request::PublishPreview(self.publish_options.clone()))
+            .is_ok()
+        {
+            self.busy = Some(Busy::Load);
+            self.status = Some("planning publish…".into());
+            self.status_error = false;
+        }
+    }
+
+    fn execute_publish(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(plan) = self.publish_plan.clone() else {
+            self.status = Some("press f to preview publish changes first".into());
+            self.status_error = true;
+            return;
+        };
+        if self.requests.send(Request::PublishExecute(plan)).is_ok() {
+            self.busy = Some(Busy::Mutation);
+            self.status = Some("publishing…".into());
+            self.status_error = false;
+        }
+    }
+
     fn update_search(&mut self) {
         let needle = self.search.query.to_lowercase();
         self.search.matches = self
@@ -279,16 +331,17 @@ impl App {
             self.handle_search_key(key);
             return;
         }
+        if let Some(substack) = move_pick(&key) {
+            self.pick(substack);
+            return;
+        }
         match (key.code, key.modifiers) {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char(' '), modifiers) if modifiers.contains(KeyModifiers::SHIFT) => {
-                self.pick(true)
-            }
-            (KeyCode::Char(' '), _) => self.pick(false),
-            (KeyCode::Char('s' | 'S'), _) => self.pick(true),
             (KeyCode::Char('a'), _) => self.apply(),
+            (KeyCode::Char('f'), _) => self.preview_publish(),
+            (KeyCode::Char('F'), _) => self.execute_publish(),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -319,11 +372,13 @@ impl App {
                 Ok(graph) => {
                     let old = self.selected.clone();
                     self.graph = Some(graph);
-                    self.preview = None;
+                    self.preview = response.preview;
+                    self.publish_plan = response.publish_plan;
                     if mutation {
                         self.carried = None;
                         self.carried_commits.clear();
                         self.pending = None;
+                        self.publish_plan = None;
                     }
                     let ids = self.graph_ids();
                     self.selected = old
@@ -421,12 +476,14 @@ impl App {
                 Span::styled(" select  ", label_style),
                 Span::styled("Enter", key_style),
                 Span::styled(" checkout/preview  ", label_style),
-                Span::styled("Space", key_style),
-                Span::styled(" commit  ", label_style),
-                Span::styled("s", key_style),
-                Span::styled(" substack  ", label_style),
+                Span::styled("m", key_style),
+                Span::styled(" move commit  ", label_style),
+                Span::styled("M", key_style),
+                Span::styled(" move substack  ", label_style),
                 Span::styled("a", key_style),
                 Span::styled(" apply  ", label_style),
+                Span::styled("f/F", key_style),
+                Span::styled(" publish preview/run  ", label_style),
                 Span::styled("Esc", key_style),
                 Span::styled(" cancel  ", label_style),
                 Span::styled("/", key_style),
@@ -475,5 +532,36 @@ impl App {
         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
         let _ = terminal.show_cursor();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_bindings_use_lowercase_for_commit_and_uppercase_for_substack() {
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
+            Some(false)
+        );
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
+            Some(true)
+        );
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn navigation_preserves_only_publish_previews() {
+        assert!(preserve_preview_while_navigating(true));
+        assert!(!preserve_preview_while_navigating(false));
     }
 }

@@ -185,8 +185,8 @@ def main() -> None:
         parser.error(str(error))
 
     print(f"Created fixture repository at {repo}")
-    manifest = Path(__file__).resolve().parents[1] / "ui" / "Cargo.toml"
-    print(f"Run: cargo run --manifest-path {manifest} -- --repo {repo}")
+    manifest = Path(__file__).resolve().parents[1] / "Cargo.toml"
+    print(f"Run: cargo run --manifest-path {manifest} -- ui --repo {repo}")
 
 
 if __name__ == "__main__":

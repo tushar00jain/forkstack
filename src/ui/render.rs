@@ -1,6 +1,6 @@
 use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 
-use crate::model::{Commit, Graph};
+use crate::ui::model::{Commit, Graph};
 
 #[derive(Clone, Debug)]
 pub struct RenderedLine {

@@ -1,14 +1,17 @@
 [package]
-name = "forkstack-ui"
+name = "forkstack"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "A native Git stack graph and history editor"
+description = "Stacked pull-request submission and interactive Git graph tooling"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 sapling-renderdag = "0.1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.dev]
 debug = 0
@@ -20,4 +23,3 @@ strip = true
 codegen-units = 16
 lto = false
 panic = "abort"
-

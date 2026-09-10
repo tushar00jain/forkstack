@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::model::{Commit, Graph, MovePlan};
+use crate::ui::model::{Commit, Graph, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
@@ -295,12 +295,11 @@ fn run_explicit_rebase(repo: &Path, plan: &MovePlan) -> Result<Output, String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let todo_path =
-        env::temp_dir().join(format!("forkstack-ui-{}-{stamp}.todo", std::process::id()));
+    let todo_path = env::temp_dir().join(format!("forkstack-{}-{stamp}.todo", std::process::id()));
     fs::write(&todo_path, explicit_rebase_todo(plan)).map_err(|error| error.to_string())?;
     let executable = env::current_exe().map_err(|error| error.to_string())?;
     let editor = format!(
-        "{} --todo-editor {}",
+        "{} todo-editor {}",
         shell_quote(&executable.to_string_lossy()),
         shell_quote(&todo_path.to_string_lossy())
     );
@@ -342,12 +341,12 @@ pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
             .unwrap_or_default()
             .as_nanos();
         let order_path =
-            env::temp_dir().join(format!("forkstack-ui-{}-{stamp}.todo", std::process::id()));
+            env::temp_dir().join(format!("forkstack-{}-{stamp}.todo", std::process::id()));
         fs::write(&order_path, format!("{}\n", plan.commits.join("\n")))
             .map_err(|error| error.to_string())?;
         let executable = env::current_exe().map_err(|error| error.to_string())?;
         let editor = format!(
-            "{} --sequence-editor {}",
+            "{} sequence-editor {}",
             shell_quote(&executable.to_string_lossy()),
             shell_quote(&order_path.to_string_lossy())
         );
@@ -387,27 +386,49 @@ pub enum Request {
     Load,
     Checkout(String),
     Apply(MovePlan),
+    PublishPreview(crate::core::submit::SubmitOptions),
+    PublishExecute(crate::core::submit::SubmitPlan),
     Stop,
 }
 
 #[derive(Debug)]
 pub struct Response {
     pub graph: Result<Graph, String>,
+    pub preview: Option<Graph>,
+    pub publish_plan: Option<crate::core::submit::SubmitPlan>,
     pub operation_error: Option<String>,
 }
 
 pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Response>) {
     while let Ok(request) = requests.recv() {
+        let mut preview = None;
+        let mut publish_plan = None;
         let operation = match request {
             Request::Load => None,
             Request::Checkout(id) => checkout(&repo, &id).err(),
             Request::Apply(plan) => apply_move(&repo, &plan).err(),
+            Request::PublishPreview(options) => match crate::core::submit::plan(options) {
+                Ok(plan) => {
+                    match load_graph(&repo).and_then(|graph| graph.publish_preview(&plan)) {
+                        Ok(graph) => {
+                            preview = Some(graph);
+                            publish_plan = Some(plan);
+                            None
+                        }
+                        Err(error) => Some(error),
+                    }
+                }
+                Err(error) => Some(error),
+            },
+            Request::PublishExecute(plan) => crate::core::submit::execute_checked(&plan).err(),
             Request::Stop => break,
         };
         let graph = load_graph(&repo);
         if responses
             .send(Response {
                 graph,
+                preview,
+                publish_plan,
                 operation_error: operation,
             })
             .is_err()
