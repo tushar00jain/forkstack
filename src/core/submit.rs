@@ -381,6 +381,10 @@ pub mod test_support {
         super::sync_local_heads(plan)
     }
 
+    pub fn sync_remote_refs(plan: &SubmitPlan) -> Result<(), String> {
+        super::sync_remote_refs(plan)
+    }
+
     pub fn valid_branch_name(branch: &str) -> bool {
         super::valid_branch_name(branch)
     }
@@ -573,16 +577,36 @@ pub fn stack_table(entries: &[(String, Option<u64>, String)], current: &str) -> 
 }
 
 pub fn execute_checked(expected: &SubmitPlan) -> Result<(), String> {
-    integrations::git::fetch(
-        &ProcessRunner,
-        &expected.options.repo,
-        &expected.options.remote,
-    )?;
+    sync_remote_refs(expected)?;
     let fresh = plan(expected.options.clone())?;
     if &fresh != expected {
         return Err("publish plan changed after fetch; press f to preview the fresh plan".into());
     }
     execute_silent(fresh)
+}
+
+fn sync_remote_refs(plan: &SubmitPlan) -> Result<(), String> {
+    let mut branches = vec![plan.options.base.clone()];
+    for step in &plan.commits {
+        branches.push(step.base_branch());
+        branches.push(step.head_branch());
+    }
+    let identity_prefixes = if plan.commits.iter().any(|step| step.identity_added) {
+        plan.options
+            .prefix
+            .as_ref()
+            .map(|prefix| vec![format!("fs-head/{prefix}")])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    integrations::git::fetch_remote_branches(
+        &ProcessRunner,
+        &plan.options.repo,
+        &plan.options.remote,
+        branches,
+        identity_prefixes,
+    )
 }
 
 pub fn execute(mut plan: SubmitPlan) -> Result<(), String> {

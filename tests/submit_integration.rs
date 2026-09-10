@@ -15,6 +15,7 @@ use serde_json::json;
 struct Fixture {
     root: PathBuf,
     repo: PathBuf,
+    remote: PathBuf,
     base: String,
     first: String,
     second: String,
@@ -38,6 +39,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&result.stderr)
     );
     String::from_utf8_lossy(&result.stdout).trim().to_owned()
+}
+
+fn ref_exists(repo: &Path, reference: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(repo)
+        .status()
+        .unwrap()
+        .success()
 }
 
 fn fixture() -> Fixture {
@@ -84,6 +94,7 @@ fn fixture() -> Fixture {
     Fixture {
         root,
         repo,
+        remote,
         base,
         first,
         second,
@@ -95,6 +106,131 @@ fn fetch_all(repo: &Path) {
         repo,
         &["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"],
     );
+}
+
+#[test]
+fn checked_execute_fetches_only_the_base_and_affected_stack_refs() {
+    let fixture = fixture();
+    let expected = plan(options(&fixture.repo)).unwrap();
+    let first_step = &expected.commits[0];
+    let missing_base = first_step.base_branch();
+    let fetched_head = first_step.head_branch();
+
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            &format!("refs/remotes/origin/{missing_base}"),
+            &fixture.first,
+        ],
+    );
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/unrelated", &fixture.base],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/main", &fixture.first],
+    );
+    git(
+        &fixture.remote,
+        &[
+            "update-ref",
+            &format!("refs/heads/{fetched_head}"),
+            &fixture.second,
+        ],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/unrelated", &fixture.second],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/tags/unrelated", &fixture.second],
+    );
+
+    let error = forkstack::core::submit::execute_checked(&expected).unwrap_err();
+    assert!(
+        error.contains("publish plan changed after fetch"),
+        "{error}"
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "refs/remotes/origin/main"]),
+        fixture.first
+    );
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["rev-parse", &format!("refs/remotes/origin/{fetched_head}")]
+        ),
+        fixture.second
+    );
+    assert!(!ref_exists(
+        &fixture.repo,
+        &format!("refs/remotes/origin/{missing_base}")
+    ));
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["rev-parse", "refs/remotes/origin/unrelated"]
+        ),
+        fixture.base
+    );
+    assert!(!ref_exists(&fixture.repo, "refs/tags/unrelated"));
+}
+
+#[test]
+fn checked_execute_detects_a_new_identity_in_the_active_prefix() {
+    let fixture = fixture();
+    let mut tagged = plan(options(&fixture.repo)).unwrap();
+    test_support::rewrite_with_identities(&mut tagged).unwrap();
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "third change"],
+    );
+    let expected = plan(options(&fixture.repo)).unwrap();
+    assert_eq!(expected.commits.len(), 3);
+    assert_eq!(expected.commits[2].branch, "draft/3");
+    assert!(expected.commits[2].identity_added);
+
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/fs-head/other/9",
+            &fixture.base,
+        ],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/fs-head/draft/4", &fixture.first],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/fs-head/other/9", &fixture.first],
+    );
+
+    let error = forkstack::core::submit::execute_checked(&expected).unwrap_err();
+    assert!(
+        error.contains("publish plan changed after fetch"),
+        "{error}"
+    );
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["rev-parse", "refs/remotes/origin/fs-head/draft/4"]
+        ),
+        fixture.first
+    );
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["rev-parse", "refs/remotes/origin/fs-head/other/9"]
+        ),
+        fixture.base
+    );
+    let fresh = plan(options(&fixture.repo)).unwrap();
+    assert_eq!(fresh.commits[2].branch, "draft/5");
 }
 
 fn advance_remote_main(fixture: &Fixture) -> String {
