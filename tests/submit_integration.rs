@@ -10,6 +10,8 @@ use forkstack::core::submit::{
     SubmitOptions, assign_branches, execute_with, identity_from_message, plan,
 };
 use forkstack::integrations::{CommandRunner, ProcessRunner};
+use forkstack::ui::git::{apply_move, apply_move_with_test_executable, checkout};
+use forkstack::ui::model::MovePlan;
 use serde_json::json;
 
 struct Fixture {
@@ -180,6 +182,47 @@ fn checked_execute_fetches_only_the_base_and_affected_stack_refs() {
 }
 
 #[test]
+fn cli_preparation_uses_only_targeted_fetches() {
+    let fixture = fixture();
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/heads/unrelated", &fixture.second],
+    );
+    git(
+        &fixture.remote,
+        &["update-ref", "refs/tags/unrelated", &fixture.second],
+    );
+    let runner = CountingRunner::default();
+
+    let prepared =
+        test_support::prepare_with_runner(options(&fixture.repo), None, &runner).unwrap();
+
+    assert_eq!(prepared.commits.len(), 2);
+    assert!(!ref_exists(&fixture.repo, "refs/remotes/origin/unrelated"));
+    assert!(!ref_exists(&fixture.repo, "refs/tags/unrelated"));
+    let calls = runner.calls.lock().unwrap();
+    assert_eq!(
+        calls.len(),
+        2,
+        "two remote comparisons and no unchanged ref fetches: {calls:?}"
+    );
+    assert_eq!(calls[0][0], "ls-remote");
+    assert_eq!(calls[1][0], "ls-remote");
+    for call in calls.iter().filter(|call| call[0] == "fetch") {
+        assert!(call.contains(&"--no-tags".into()), "{call:?}");
+        assert!(
+            call.iter().any(|arg| arg.starts_with("+refs/heads/")),
+            "targeted fetch lacks a refspec: {call:?}"
+        );
+    }
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.contains(&"refs/heads/unrelated".into()))
+    );
+}
+
+#[test]
 fn checked_execute_detects_a_new_identity_in_the_active_prefix() {
     let fixture = fixture();
     let mut tagged = plan(options(&fixture.repo)).unwrap();
@@ -298,12 +341,30 @@ struct FakeRunner {
     state: Mutex<FakeState>,
 }
 
-fn option(args: &[String], name: &str) -> String {
-    args.iter()
-        .position(|arg| arg == name)
-        .and_then(|index| args.get(index + 1))
-        .unwrap_or_else(|| panic!("missing {name} in {args:?}"))
-        .clone()
+fn graphql_values(query: &str, field: &str) -> Vec<String> {
+    query
+        .match_indices(field)
+        .map(|(index, _)| {
+            serde_json::Deserializer::from_str(&query[index + field.len()..])
+                .into_iter::<String>()
+                .next()
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn fake_pr_json(pr: &FakePr, head: &str) -> serde_json::Value {
+    json!({
+        "id": format!("PR_{}", pr.number),
+        "number": pr.number,
+        "baseRefName": pr.base,
+        "headRefName": head,
+        "title": pr.title,
+        "body": pr.body,
+        "isDraft": pr.draft,
+        "url": format!("https://github.com/example/repo/pull/{}", pr.number),
+    })
 }
 
 impl CommandRunner for FakeRunner {
@@ -325,50 +386,69 @@ impl CommandRunner for FakeRunner {
         }
         assert_eq!(program, "gh");
         let mut state = self.state.lock().unwrap();
-        state.events.push(format!("gh:{}", args[1]));
-        match args.get(1).map(String::as_str) {
-            Some("list") => {
-                let head = option(args, "--head");
-                Ok(state.prs.get(&head).map_or_else(
-                    || "[]".into(),
-                    |pr| {
-                        json!([{
-                            "number": pr.number,
-                            "baseRefName": pr.base,
-                            "title": pr.title,
-                            "body": pr.body,
-                        }])
-                        .to_string()
-                    },
-                ))
-            }
-            Some("create") => {
-                let head = option(args, "--head");
-                let number = 101 + state.prs.len() as u64;
-                state.prs.insert(
-                    head,
-                    FakePr {
-                        number,
-                        base: option(args, "--base"),
-                        title: option(args, "--title"),
-                        body: option(args, "--body"),
-                        draft: args.iter().any(|arg| arg == "--draft"),
-                    },
-                );
-                Ok(format!("https://github.com/example/repo/pull/{number}"))
-            }
-            Some("edit") => {
-                let number: u64 = args[2].parse().unwrap();
-                let pr = state
+        assert_eq!(args.get(1).map(String::as_str), Some("graphql"));
+        assert_eq!(args, ["api", "graphql", "--input", "-"]);
+        let request: serde_json::Value = serde_json::from_str(input.unwrap()).unwrap();
+        let query = request["query"].as_str().unwrap().to_owned();
+        if query.starts_with("query(") {
+            state.events.push("gh:discover".into());
+            let heads = graphql_values(&query, "headRefName:");
+            let mut repository = serde_json::Map::from_iter([("id".into(), json!("R_repo"))]);
+            for (index, head) in heads.iter().enumerate() {
+                let nodes = state
                     .prs
-                    .values_mut()
-                    .find(|pr| pr.number == number)
-                    .unwrap();
-                pr.title = option(args, "--title");
-                pr.body = option(args, "--body");
-                Ok(String::new())
+                    .get(head)
+                    .map(|pr| vec![fake_pr_json(pr, head)])
+                    .unwrap_or_default();
+                repository.insert(format!("p{index}"), json!({"nodes": nodes}));
             }
-            other => panic!("unexpected gh invocation {other:?}: {args:?}"),
+            Ok(json!({"data": {"repository": repository}}).to_string())
+        } else if query.contains("createPullRequest") {
+            state.events.push("gh:create".into());
+            let bases = graphql_values(&query, "baseRefName:");
+            let heads = graphql_values(&query, "headRefName:");
+            let titles = graphql_values(&query, "title:");
+            let bodies = graphql_values(&query, "body:");
+            let draft = query.contains("draft:true");
+            let mut data = serde_json::Map::new();
+            for index in 0..heads.len() {
+                let number = 101 + state.prs.len() as u64;
+                let pr = FakePr {
+                    number,
+                    base: bases[index].clone(),
+                    title: titles[index].clone(),
+                    body: bodies[index].clone(),
+                    draft,
+                };
+                data.insert(
+                    format!("p{index}"),
+                    json!({"pullRequest": fake_pr_json(&pr, &heads[index])}),
+                );
+                state.prs.insert(heads[index].clone(), pr);
+            }
+            Ok(json!({"data": data}).to_string())
+        } else if query.contains("updatePullRequest") {
+            state.events.push("gh:edit".into());
+            let ids = graphql_values(&query, "pullRequestId:");
+            let titles = graphql_values(&query, "title:");
+            let bodies = graphql_values(&query, "body:");
+            let mut data = serde_json::Map::new();
+            for index in 0..ids.len() {
+                let (head, pr) = state
+                    .prs
+                    .iter_mut()
+                    .find(|(_, pr)| format!("PR_{}", pr.number) == ids[index])
+                    .unwrap();
+                pr.title = titles[index].clone();
+                pr.body = bodies[index].clone();
+                data.insert(
+                    format!("p{index}"),
+                    json!({"pullRequest": fake_pr_json(pr, head)}),
+                );
+            }
+            Ok(json!({"data": data}).to_string())
+        } else {
+            panic!("unexpected gh GraphQL invocation: {args:?}")
         }
     }
 }
@@ -472,12 +552,19 @@ fn graph_does_not_walk_unrelated_branch_history() {
         &["commit", "--allow-empty", "-m", "unrelated root"],
     );
     let unrelated = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["tag", "unrelated-tag", &unrelated]);
     git(&fixture.repo, &["switch", "main"]);
+    git(&fixture.repo, &["tag", "visible-tag", &fixture.first]);
 
     let graph = forkstack::ui::git::load_graph_for(&fixture.repo, "origin", "main").unwrap();
     assert!(!graph.commits.contains_key(&unrelated));
     assert!(graph.commits.contains_key(&fixture.second));
     assert!(graph.commits.contains_key(&fixture.base));
+    assert!(
+        graph.commits[&fixture.first]
+            .tags
+            .contains(&"visible-tag".into())
+    );
 }
 
 #[test]
@@ -513,6 +600,104 @@ fn graph_reads_conflicted_paths_from_the_index() {
         graph.commits[&incoming].conflict.as_deref(),
         Some("incoming, conflict (merge: shared)")
     );
+}
+
+#[test]
+fn checkout_lets_git_refuse_a_conflicting_dirty_switch_without_data_loss() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &["switch", "-c", "checkout-target", &fixture.base],
+    );
+    fs::write(fixture.repo.join("base"), "target contents\n").unwrap();
+    git(&fixture.repo, &["add", "base"]);
+    git(&fixture.repo, &["commit", "-m", "change base on target"]);
+    let target = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "main"]);
+    fs::write(fixture.repo.join("base"), "unsaved contents\n").unwrap();
+
+    let error = checkout(&fixture.repo, &target).unwrap_err();
+    assert!(error.contains("local changes"), "{error}");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("base")).unwrap(),
+        "unsaved contents\n"
+    );
+    assert_eq!(git(&fixture.repo, &["branch", "--show-current"]), "main");
+}
+
+#[test]
+fn detached_apply_restores_branch_when_git_refuses_dirty_rebase() {
+    let fixture = fixture();
+    fs::write(fixture.repo.join("first"), "unsaved contents\n").unwrap();
+    let plan = MovePlan {
+        selected: fixture.first.clone(),
+        destination: fixture.base.clone(),
+        include_descendants: false,
+        base: fixture.base.clone(),
+        source_base: fixture.base.clone(),
+        carried_count: 2,
+        tip: "main".into(),
+        tip_commit: fixture.second.clone(),
+        detach_for_rewrite: true,
+        checkout_branch: "main".into(),
+        ref_updates: Vec::new(),
+        commits: vec![fixture.first.clone(), fixture.second.clone()],
+    };
+
+    let error = apply_move(&fixture.repo, &plan).unwrap_err();
+    assert!(error.contains("unstaged changes"), "{error}");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("first")).unwrap(),
+        "unsaved contents\n"
+    );
+    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"]), fixture.second);
+    assert_eq!(git(&fixture.repo, &["branch", "--show-current"]), "main");
+}
+
+#[test]
+fn detached_apply_preserves_a_real_rebase_conflict() {
+    let fixture = fixture();
+    fs::write(fixture.repo.join("shared"), "base\n").unwrap();
+    git(&fixture.repo, &["add", "shared"]);
+    git(&fixture.repo, &["commit", "-m", "shared base"]);
+    let base = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    fs::write(fixture.repo.join("shared"), "first\n").unwrap();
+    git(&fixture.repo, &["commit", "-am", "shared first"]);
+    let first = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    fs::write(fixture.repo.join("shared"), "second\n").unwrap();
+    git(&fixture.repo, &["commit", "-am", "shared second"]);
+    let second = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let plan = MovePlan {
+        selected: first.clone(),
+        destination: base.clone(),
+        include_descendants: false,
+        base,
+        source_base: fixture.second.clone(),
+        carried_count: 2,
+        tip: "main".into(),
+        tip_commit: second.clone(),
+        detach_for_rewrite: true,
+        checkout_branch: "main".into(),
+        ref_updates: Vec::new(),
+        commits: vec![second, first],
+    };
+
+    let error = apply_move_with_test_executable(
+        &fixture.repo,
+        &plan,
+        Path::new(env!("CARGO_BIN_EXE_forkstack")),
+    )
+    .unwrap_err();
+    assert!(
+        error.contains("conflict") || error.contains("could not apply"),
+        "{error}"
+    );
+    assert_eq!(git(&fixture.repo, &["branch", "--show-current"]), "");
+    assert_ne!(
+        git(&fixture.repo, &["diff", "--name-only", "--diff-filter=U"]),
+        ""
+    );
+    git(&fixture.repo, &["rebase", "--abort"]);
 }
 
 #[test]
@@ -708,6 +893,32 @@ fn head_checked_out_in_another_worktree_is_not_overwritten() {
 }
 
 #[test]
+fn wrong_pr_base_fails_before_identity_or_local_ref_mutation() {
+    let fixture = fixture();
+    let runner = FakeRunner::default();
+    runner.state.lock().unwrap().prs.insert(
+        "fs-head/draft/1".into(),
+        FakePr {
+            number: 101,
+            base: "wrong-base".into(),
+            title: "first change".into(),
+            body: String::new(),
+            draft: true,
+        },
+    );
+    let original_head = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let mut submit = plan(options(&fixture.repo)).unwrap();
+    assert!(submit.commits.iter().any(|step| step.identity_added));
+
+    let error = execute_with(&mut submit, &runner, &mut |_| {}).unwrap_err();
+
+    assert!(error.contains("targets \"wrong-base\""), "{error}");
+    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"]), original_head);
+    assert!(!ref_exists(&fixture.repo, "refs/heads/fs-head/draft/1"));
+    assert_eq!(runner.state.lock().unwrap().events, ["gh:discover"]);
+}
+
+#[test]
 fn execute_creates_and_then_restacks_pull_requests() {
     let fixture = fixture();
     let runner = FakeRunner::default();
@@ -774,15 +985,7 @@ fn execute_creates_and_then_restacks_pull_requests() {
         assert!(state.pushes[0].contains(&"--force-with-lease".into()));
         assert_eq!(
             state.events,
-            [
-                "gh:list",
-                "gh:list",
-                "git:push",
-                "gh:create",
-                "gh:create",
-                "gh:edit",
-                "gh:edit"
-            ]
+            ["gh:discover", "git:push", "gh:create", "gh:edit"]
         );
     }
 
@@ -792,7 +995,7 @@ fn execute_creates_and_then_restacks_pull_requests() {
     git(&fixture.repo, &["cherry-pick", &seeded[0]]);
     let reordered_first = git(&fixture.repo, &["rev-parse", "HEAD"]);
 
-    let mut second_plan = plan(options).unwrap();
+    let mut second_plan = plan(options.clone()).unwrap();
     execute_with(&mut second_plan, &runner, &mut |_| {}).unwrap();
     fetch_all(&fixture.repo);
     let first_head = git(&fixture.repo, &["rev-parse", "origin/fs-head/draft/1"]);
@@ -870,8 +1073,15 @@ fn execute_creates_and_then_restacks_pull_requests() {
     }
     assert!(state.pushes[1].contains(&"--atomic".into()));
     assert!(state.pushes[1].contains(&"--force-with-lease".into()));
+    assert_eq!(&state.events[4..], ["gh:discover", "git:push", "gh:edit"]);
+    drop(state);
+
+    let mut unchanged_plan = plan(options).unwrap();
+    execute_with(&mut unchanged_plan, &runner, &mut |_| {}).unwrap();
+    let state = runner.state.lock().unwrap();
     assert_eq!(
         &state.events[7..],
-        ["gh:list", "gh:list", "git:push", "gh:edit", "gh:edit"]
+        ["gh:discover", "git:push"],
+        "an unchanged existing stack uses one batched GitHub read and no per-commit GitHub commands"
     );
 }

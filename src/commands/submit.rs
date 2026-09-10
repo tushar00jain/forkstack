@@ -45,13 +45,8 @@ impl SubmitArgs {
 pub fn run(args: SubmitArgs) -> Result<(), String> {
     let options = args.options();
     if args.execute {
-        println!("fetching {}", options.remote);
-        crate::integrations::git::fetch(
-            &crate::integrations::ProcessRunner,
-            &options.repo,
-            &options.remote,
-        )?;
-        let plan = submit::plan(options)?;
+        println!("syncing remote state from {}", options.remote);
+        let plan = submit::prepare(options, None)?;
         submit::print_summary(&plan);
         submit::execute(plan)
     } else {

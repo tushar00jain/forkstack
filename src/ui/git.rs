@@ -1,12 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use git2::{Oid, Repository, Sort};
+use git2::{Oid, Repository, RepositoryState, Sort};
 
 use crate::ui::model::{Commit, Graph, MovePlan};
 
@@ -27,14 +27,6 @@ fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
         let stdout = String::from_utf8_lossy(&result.stdout).trim().to_owned();
         Err(if stderr.is_empty() { stdout } else { stderr })
     }
-}
-
-fn verify(repo: &Path, revision: &str) -> Option<String> {
-    let result = output(repo, &["rev-parse", "--verify", "-q", revision]).ok()?;
-    result
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&result.stdout).trim().to_owned())
 }
 
 pub fn conflict_label(markers: &[(String, String)], files: &[String]) -> Option<String> {
@@ -60,38 +52,19 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
     load_graph_for(repo, "origin", "main")
 }
 
-fn add_matching_refs(
-    repository: &Repository,
-    glob: &str,
-    roots: &mut BTreeSet<Oid>,
-    refs: &mut Vec<(Oid, String)>,
-) -> Result<(), String> {
-    let iter = repository
-        .references_glob(glob)
-        .map_err(|error| error.message().to_owned())?;
-    for reference in iter {
-        let reference = reference.map_err(|error| error.message().to_owned())?;
-        let Some(name) = reference.name() else {
-            continue;
-        };
-        let Ok(commit) = reference.peel_to_commit() else {
-            continue;
-        };
-        roots.insert(commit.id());
-        refs.push((commit.id(), name.to_owned()));
-    }
-    Ok(())
-}
-
-fn bounded_ref_globs(remote: &str, base: &str) -> [String; 6] {
-    [
-        "refs/heads/fs-head/*".into(),
-        "refs/heads/fs-base/*".into(),
-        format!("refs/heads/{base}"),
-        format!("refs/remotes/{remote}/fs-head/*"),
-        format!("refs/remotes/{remote}/fs-base/*"),
-        format!("refs/remotes/{remote}/{base}"),
-    ]
+fn is_graph_root_ref(
+    name: &str,
+    local_base: &str,
+    remote_base: &str,
+    remote_head_prefix: &str,
+    remote_base_prefix: &str,
+) -> bool {
+    name == local_base
+        || name.starts_with("refs/heads/fs-head/")
+        || name.starts_with("refs/heads/fs-base/")
+        || name == remote_base
+        || name.starts_with(remote_head_prefix)
+        || name.starts_with(remote_base_prefix)
 }
 
 fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
@@ -150,8 +123,39 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     if let Some(name) = head_ref.name() {
         refs.push((head_oid, name.to_owned()));
     }
-    for glob in bounded_ref_globs(remote, base) {
-        add_matching_refs(&repository, &glob, &mut roots, &mut refs)?;
+    let local_base = format!("refs/heads/{base}");
+    let remote_base = format!("refs/remotes/{remote}/{base}");
+    let remote_head_prefix = format!("refs/remotes/{remote}/fs-head/");
+    let remote_base_prefix = format!("refs/remotes/{remote}/fs-base/");
+    let mut tags = Vec::new();
+    for reference in repository
+        .references()
+        .map_err(|error| error.message().to_owned())?
+    {
+        let reference = reference.map_err(|error| error.message().to_owned())?;
+        let Some(name) = reference.name() else {
+            continue;
+        };
+        let is_root = is_graph_root_ref(
+            name,
+            &local_base,
+            &remote_base,
+            &remote_head_prefix,
+            &remote_base_prefix,
+        );
+        let is_tag = name.starts_with("refs/tags/");
+        if !is_root && !is_tag {
+            continue;
+        }
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        if is_root {
+            roots.insert(commit.id());
+            refs.push((commit.id(), name.to_owned()));
+        } else {
+            tags.push((commit.id(), name.to_owned()));
+        }
     }
     for (_, id) in &markers {
         if let Ok(oid) = Oid::from_str(id) {
@@ -209,16 +213,11 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
         }
     }
     // Tags decorate visible commits but are deliberately not graph roots.
-    if let Ok(tags) = repository.references_glob("refs/tags/*") {
-        for reference in tags.flatten() {
-            let (Some(name), Ok(commit)) = (reference.name(), reference.peel_to_commit()) else {
-                continue;
-            };
-            if let Some(visible) = commits.get_mut(&commit.id().to_string()) {
-                visible
-                    .tags
-                    .push(name.trim_start_matches("refs/tags/").to_owned());
-            }
+    for (oid, name) in tags {
+        if let Some(visible) = commits.get_mut(&oid.to_string()) {
+            visible
+                .tags
+                .push(name.trim_start_matches("refs/tags/").to_owned());
         }
     }
     if let Some(commit) = commits.get_mut(&head) {
@@ -249,37 +248,22 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     })
 }
 
-fn assert_clean(repo: &Path) -> Result<(), String> {
-    if !run(repo, &["status", "--porcelain"])?.is_empty() {
-        return Err("the working tree must be clean".into());
-    }
-    for state in ["REBASE_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD"] {
-        if verify(repo, state).is_some() {
-            return Err("finish the current Git operation first".into());
-        }
-    }
-    let git_dir = PathBuf::from(run(repo, &["rev-parse", "--absolute-git-dir"])?);
-    if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
-        return Err("finish the current Git operation first".into());
-    }
-    Ok(())
-}
-
 pub fn checkout(repo: &Path, revision: &str) -> Result<(), String> {
-    assert_clean(repo)?;
-    let refs = run(
-        repo,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "--points-at",
-            revision,
-            "refs/heads",
-        ],
-    )?;
-    let branches: Vec<_> = refs.lines().filter(|line| !line.is_empty()).collect();
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    let target = repository
+        .revparse_single(revision)
+        .and_then(|object| object.peel_to_commit())
+        .map_err(|error| error.message().to_owned())?
+        .id();
+    let branches: Vec<_> = repository
+        .references_glob("refs/heads/*")
+        .map_err(|error| error.message().to_owned())?
+        .filter_map(Result::ok)
+        .filter(|reference| reference.target() == Some(target))
+        .filter_map(|reference| reference.shorthand().map(str::to_owned))
+        .collect();
     if branches.len() == 1 {
-        run(repo, &["switch", branches[0]])?;
+        run(repo, &["switch", &branches[0]])?;
     } else {
         run(repo, &["switch", "--detach", revision])?;
     }
@@ -361,14 +345,13 @@ fn explicit_rebase_todo(plan: &MovePlan) -> String {
     todo
 }
 
-fn run_explicit_rebase(repo: &Path, plan: &MovePlan) -> Result<Output, String> {
+fn run_explicit_rebase(repo: &Path, plan: &MovePlan, executable: &Path) -> Result<Output, String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let todo_path = env::temp_dir().join(format!("forkstack-{}-{stamp}.todo", std::process::id()));
     fs::write(&todo_path, explicit_rebase_todo(plan)).map_err(|error| error.to_string())?;
-    let executable = env::current_exe().map_err(|error| error.to_string())?;
     let editor = format!(
         "{} todo-editor {}",
         shell_quote(&executable.to_string_lossy()),
@@ -400,12 +383,36 @@ fn run_explicit_rebase(repo: &Path, plan: &MovePlan) -> Result<Output, String> {
 }
 
 pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
-    assert_clean(repo)?;
-    if plan.detach_for_rewrite && !plan.include_descendants {
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    apply_move_with_executable(repo, plan, &executable)
+}
+
+fn apply_move_with_executable(
+    repo: &Path,
+    plan: &MovePlan,
+    executable: &Path,
+) -> Result<(), String> {
+    let detached_rewrite = plan.detach_for_rewrite && !plan.include_descendants;
+    let original_checkout = if detached_rewrite {
+        let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+        let head = repository
+            .head()
+            .map_err(|error| error.message().to_owned())?;
+        if head.is_branch() {
+            head.shorthand().map(|name| (false, name.to_owned()))
+        } else {
+            head.peel_to_commit()
+                .ok()
+                .map(|commit| (true, commit.id().to_string()))
+        }
+    } else {
+        None
+    };
+    if detached_rewrite {
         run(repo, &["switch", "--detach", &plan.tip_commit])?;
     }
     let result = if plan.include_descendants {
-        run_explicit_rebase(repo, plan)?
+        run_explicit_rebase(repo, plan, executable)?
     } else {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -415,7 +422,6 @@ pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
             env::temp_dir().join(format!("forkstack-{}-{stamp}.todo", std::process::id()));
         fs::write(&order_path, format!("{}\n", plan.commits.join("\n")))
             .map_err(|error| error.to_string())?;
-        let executable = env::current_exe().map_err(|error| error.to_string())?;
         let editor = format!(
             "{} sequence-editor {}",
             shell_quote(&executable.to_string_lossy()),
@@ -441,15 +447,50 @@ pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
         result
     };
     if result.status.success() {
-        if plan.detach_for_rewrite && !plan.include_descendants {
+        if detached_rewrite {
             run(repo, &["switch", &plan.checkout_branch])?;
         }
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&result.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&result.stdout).trim().to_owned();
-        Err(if stderr.is_empty() { stdout } else { stderr })
+        let error = if stderr.is_empty() { stdout } else { stderr };
+        if detached_rewrite {
+            let state = Repository::discover(repo)
+                .map_err(|restore_error| {
+                    format!(
+                        "{error}\nAdditionally, could not inspect the repository for recovery: {}",
+                        restore_error.message()
+                    )
+                })?
+                .state();
+            if state == RepositoryState::Clean
+                && let Some((was_detached, original)) = original_checkout
+            {
+                let restore = if was_detached {
+                    run(repo, &["switch", "--detach", &original])
+                } else {
+                    run(repo, &["switch", &original])
+                };
+                if let Err(restore_error) = restore {
+                    return Err(format!(
+                        "{error}\nAdditionally, could not restore the original checkout: {restore_error}"
+                    ));
+                }
+            }
+        }
+        Err(error)
     }
+}
+
+#[cfg(feature = "integration-tests")]
+#[doc(hidden)]
+pub fn apply_move_with_test_executable(
+    repo: &Path,
+    plan: &MovePlan,
+    executable: &Path,
+) -> Result<(), String> {
+    apply_move_with_executable(repo, plan, executable)
 }
 
 #[derive(Debug)]
@@ -542,17 +583,46 @@ mod tests {
 
     #[test]
     fn graph_roots_are_limited_to_forkstack_and_configured_base_refs() {
-        assert_eq!(
-            bounded_ref_globs("upstream", "trunk"),
-            [
-                "refs/heads/fs-head/*",
-                "refs/heads/fs-base/*",
-                "refs/heads/trunk",
-                "refs/remotes/upstream/fs-head/*",
-                "refs/remotes/upstream/fs-base/*",
-                "refs/remotes/upstream/trunk",
-            ]
-        );
+        let local_base = "refs/heads/trunk";
+        let remote_base = "refs/remotes/upstream/trunk";
+        let remote_head_prefix = "refs/remotes/upstream/fs-head/";
+        let remote_base_prefix = "refs/remotes/upstream/fs-base/";
+        for name in [
+            "refs/heads/fs-head/topic/1",
+            "refs/heads/fs-base/topic/1",
+            "refs/heads/trunk",
+            "refs/remotes/upstream/fs-head/topic/1",
+            "refs/remotes/upstream/fs-base/topic/1",
+            "refs/remotes/upstream/trunk",
+        ] {
+            assert!(
+                is_graph_root_ref(
+                    name,
+                    local_base,
+                    remote_base,
+                    remote_head_prefix,
+                    remote_base_prefix
+                ),
+                "{name}"
+            );
+        }
+        for name in [
+            "refs/heads/unrelated",
+            "refs/remotes/origin/trunk",
+            "refs/remotes/upstream/unrelated",
+            "refs/tags/v1",
+        ] {
+            assert!(
+                !is_graph_root_ref(
+                    name,
+                    local_base,
+                    remote_base,
+                    remote_head_prefix,
+                    remote_base_prefix
+                ),
+                "{name}"
+            );
+        }
     }
 
     #[test]

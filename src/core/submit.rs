@@ -389,8 +389,12 @@ pub mod test_support {
         super::sync_local_heads(plan)
     }
 
-    pub fn sync_remote_refs(plan: &SubmitPlan) -> Result<(), String> {
-        super::sync_remote_refs(plan)
+    pub fn prepare_with_runner(
+        options: SubmitOptions,
+        expected: Option<&SubmitPlan>,
+        runner: &dyn CommandRunner,
+    ) -> Result<SubmitPlan, String> {
+        super::prepare_with(options, expected, runner)
     }
 
     pub fn valid_branch_name(branch: &str) -> bool {
@@ -644,15 +648,33 @@ pub fn stack_table(entries: &[(String, Option<u64>, String)], current: &str) -> 
 }
 
 pub fn execute_checked(expected: &SubmitPlan) -> Result<(), String> {
-    sync_remote_refs(expected)?;
-    let fresh = plan(expected.options.clone())?;
+    let fresh = prepare(expected.options.clone(), Some(expected))?;
     if &fresh != expected {
         return Err("publish plan changed after fetch; press f to preview the fresh plan".into());
     }
     execute_silent(fresh)
 }
 
-fn sync_remote_refs(plan: &SubmitPlan) -> Result<(), String> {
+pub fn prepare(
+    options: SubmitOptions,
+    expected: Option<&SubmitPlan>,
+) -> Result<SubmitPlan, String> {
+    prepare_with(options, expected, &ProcessRunner)
+}
+
+fn sync_remote_refs(plan: &SubmitPlan, runner: &dyn CommandRunner) -> Result<(), String> {
+    let (branches, identity_prefixes) = remote_sync_scope(plan);
+    let missing = integrations::git::fetch_remote_branches(
+        runner,
+        &plan.options.repo,
+        &plan.options.remote,
+        branches,
+        identity_prefixes,
+    )?;
+    integrations::git::delete_refs(&plan.options.repo, &missing)
+}
+
+fn remote_sync_scope(plan: &SubmitPlan) -> (Vec<String>, Vec<String>) {
     let mut branches = vec![plan.options.base.clone()];
     for step in &plan.commits {
         branches.push(step.base_branch());
@@ -667,13 +689,29 @@ fn sync_remote_refs(plan: &SubmitPlan) -> Result<(), String> {
     } else {
         Vec::new()
     };
-    integrations::git::fetch_remote_branches(
-        &ProcessRunner,
-        &plan.options.repo,
-        &plan.options.remote,
-        branches,
-        identity_prefixes,
-    )
+    (branches, identity_prefixes)
+}
+
+fn prepare_with(
+    options: SubmitOptions,
+    expected: Option<&SubmitPlan>,
+    runner: &dyn CommandRunner,
+) -> Result<SubmitPlan, String> {
+    if let Some(expected) = expected {
+        sync_remote_refs(expected, runner)?;
+    } else {
+        let missing = integrations::git::fetch_remote_branches(
+            runner,
+            &options.repo,
+            &options.remote,
+            [options.base.clone()],
+            [],
+        )?;
+        integrations::git::delete_refs(&options.repo, &missing)?;
+        let provisional = plan(options.clone())?;
+        sync_remote_refs(&provisional, runner)?;
+    }
+    plan(options)
 }
 
 pub fn execute(mut plan: SubmitPlan) -> Result<(), String> {
@@ -691,32 +729,32 @@ pub fn execute_with(
     runner: &dyn CommandRunner,
     report: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
+    let heads: Vec<_> = plan.commits.iter().map(StackCommit::head_branch).collect();
+    let mut discovery =
+        integrations::github::discover_prs(runner, &plan.options.repo, &plan.fork, &heads)?;
+    let mut prs = Vec::with_capacity(plan.commits.len());
+    let mut was_existing = Vec::with_capacity(plan.commits.len());
+    for step in &plan.commits {
+        let pr = discovery.by_head.remove(&step.head_branch());
+        if let Some(pr) = pr.as_ref()
+            && pr.base_ref_name != step.base_branch()
+        {
+            return Err(format!(
+                "PR #{} targets {:?}; expected {:?}",
+                pr.number,
+                pr.base_ref_name,
+                step.base_branch()
+            ));
+        }
+        was_existing.push(pr.is_some());
+        prs.push(pr);
+    }
     if plan.commits.iter().any(|step| step.identity_added) {
         report(&format!("recording stable {IDENTITY_TRAILER} trailers"));
         rewrite_with_identities(plan)?;
     }
     report("updating local PR head branches");
     sync_local_heads(plan)?;
-    let mut numbers = Vec::new();
-    for step in &plan.commits {
-        let pr = integrations::github::existing_pr(
-            runner,
-            &plan.options.repo,
-            &plan.fork,
-            &step.head_branch(),
-        )?;
-        if let Some(pr) = pr.as_ref() {
-            if pr.base_ref_name != step.base_branch() {
-                return Err(format!(
-                    "PR #{} targets {:?}; expected {:?}",
-                    pr.number,
-                    pr.base_ref_name,
-                    step.base_branch()
-                ));
-            }
-        }
-        numbers.push(pr.map(|pr| pr.number));
-    }
     report("pushing PR base and head refs");
     integrations::git::push_atomic(
         runner,
@@ -726,48 +764,80 @@ pub fn execute_with(
             .iter()
             .map(|update| (update.branch.clone(), update.rev.clone())),
     )?;
+    let missing: Vec<_> = plan
+        .commits
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| prs[*index].is_none())
+        .collect();
+    let bases: Vec<_> = plan.commits.iter().map(StackCommit::base_branch).collect();
+    let create_requests: Vec<_> = missing
+        .iter()
+        .map(|(index, step)| integrations::github::CreatePullRequest {
+            base: &bases[*index],
+            head: &heads[*index],
+            title: &step.subject,
+            body: &step.body,
+            draft: plan.options.draft,
+        })
+        .collect();
+    let created = integrations::github::create_prs(
+        runner,
+        &plan.options.repo,
+        &discovery.repository_id,
+        &create_requests,
+    )?;
+    for ((index, _), pr) in missing.into_iter().zip(created) {
+        prs[index] = Some(pr);
+    }
     for (index, step) in plan.commits.iter().enumerate() {
-        if let Some(number) = numbers[index] {
-            report(&format!("{}: reusing #{number}", step.branch));
+        if was_existing[index] {
+            report(&format!(
+                "{}: reusing #{}",
+                step.branch,
+                prs[index].as_ref().unwrap().number
+            ));
         } else {
-            let url = integrations::github::create_pr(
-                runner,
-                &plan.options.repo,
-                &plan.fork,
-                &step.base_branch(),
-                &step.head_branch(),
-                &step.subject,
-                &step.body,
-                plan.options.draft,
-            )?;
-            let number = url
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .and_then(|value| value.parse().ok())
-                .ok_or_else(|| format!("could not read pull request number from {url:?}"))?;
-            report(&format!("{}: created {url}", step.branch));
-            numbers[index] = Some(number);
+            report(&format!(
+                "{}: created {}",
+                step.branch,
+                prs[index].as_ref().unwrap().url
+            ));
         }
     }
     let entries: Vec<_> = plan
         .commits
         .iter()
         .enumerate()
-        .map(|(index, step)| (step.branch.clone(), numbers[index], step.subject.clone()))
+        .map(|(index, step)| {
+            (
+                step.branch.clone(),
+                prs[index].as_ref().map(|pr| pr.number),
+                step.subject.clone(),
+            )
+        })
         .collect();
-    for (index, step) in plan.commits.iter().enumerate() {
-        if let Some(number) = numbers[index] {
-            integrations::github::edit_pr(
-                runner,
-                &plan.options.repo,
-                &plan.fork,
-                number,
-                &step.subject,
-                &format!("{}{}", stack_table(&entries, &step.branch), step.body),
-            )?;
-        }
-    }
+    let desired_bodies: Vec<_> = plan
+        .commits
+        .iter()
+        .map(|step| format!("{}{}", stack_table(&entries, &step.branch), step.body))
+        .collect();
+    let edits: Vec<_> = plan
+        .commits
+        .iter()
+        .enumerate()
+        .filter_map(|(index, step)| {
+            let pr = prs[index].as_ref()?;
+            (pr.title != step.subject || pr.body != desired_bodies[index]).then_some(
+                integrations::github::EditPullRequest {
+                    id: &pr.id,
+                    title: &step.subject,
+                    body: &desired_bodies[index],
+                },
+            )
+        })
+        .collect();
+    integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
     report(&format!(
         "\n{} pull requests in {}.",
         plan.commits.len(),
@@ -878,5 +948,31 @@ mod tests {
             stack_table(&entries, "a/1").find("#11").unwrap()
                 < stack_table(&entries, "a/1").find("#10").unwrap()
         );
+    }
+
+    #[test]
+    fn cli_bootstrap_scope_is_limited_to_base_stack_and_active_prefix() {
+        let plan = SubmitPlan {
+            options: SubmitOptions {
+                base: "trunk".into(),
+                prefix: Some("topic".into()),
+                ..SubmitOptions::default()
+            },
+            fork: "owner/repo".into(),
+            base_ref: "origin/trunk".into(),
+            commits: vec![StackCommit {
+                rev: "b".into(),
+                parent: "a".into(),
+                branch: "topic/1".into(),
+                subject: "subject".into(),
+                body: String::new(),
+                message: "subject".into(),
+                identity_added: true,
+            }],
+            updates: Vec::new(),
+        };
+        let (branches, prefixes) = remote_sync_scope(&plan);
+        assert_eq!(branches, ["trunk", "fs-base/topic/1", "fs-head/topic/1"]);
+        assert_eq!(prefixes, ["fs-head/topic"]);
     }
 }

@@ -21,20 +21,6 @@ pub fn run_owned(
     runner.run("git", args, repo, None, &BTreeMap::new())
 }
 
-pub fn run_input(
-    runner: &dyn CommandRunner,
-    repo: &Path,
-    args: &[String],
-    input: &str,
-    env: &BTreeMap<String, String>,
-) -> Result<String, String> {
-    runner.run("git", args, repo, Some(input), env)
-}
-
-pub fn fetch(runner: &dyn CommandRunner, repo: &Path, remote: &str) -> Result<(), String> {
-    run(runner, repo, &["fetch", remote]).map(|_| ())
-}
-
 fn remote_branch_refs(
     remote: &str,
     branches: impl IntoIterator<Item = String>,
@@ -52,13 +38,95 @@ fn remote_branch_refs(
         .collect()
 }
 
+fn changed_refspecs(
+    wanted: &BTreeMap<String, (String, String)>,
+    local_targets: &BTreeMap<String, String>,
+) -> Vec<String> {
+    wanted
+        .iter()
+        .filter(|(destination, (_, oid))| local_targets.get(*destination) != Some(oid))
+        .map(|(destination, (source, _))| format!("+{source}:{destination}"))
+        .collect()
+}
+
+trait LocalRefs {
+    fn targets(
+        &self,
+        exact: &[String],
+        prefixes: &[String],
+    ) -> Result<BTreeMap<String, String>, String>;
+}
+
+struct Git2LocalRefs<'a> {
+    repo: &'a Path,
+}
+
+impl LocalRefs for Git2LocalRefs<'_> {
+    fn targets(
+        &self,
+        exact: &[String],
+        prefixes: &[String],
+    ) -> Result<BTreeMap<String, String>, String> {
+        let repository =
+            git2::Repository::discover(self.repo).map_err(|error| error.message().to_owned())?;
+        let mut targets = BTreeMap::new();
+        for name in exact {
+            if let Ok(reference) = repository.find_reference(name) {
+                targets.insert(
+                    name.clone(),
+                    reference
+                        .target()
+                        .map(|oid| oid.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        for pattern in prefixes {
+            for reference in repository
+                .references_glob(pattern)
+                .map_err(|error| error.message().to_owned())?
+            {
+                let reference = reference.map_err(|error| error.message().to_owned())?;
+                if let Some(name) = reference.name() {
+                    targets.insert(
+                        name.to_owned(),
+                        reference
+                            .target()
+                            .map(|oid| oid.to_string())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Ok(targets)
+    }
+}
+
 pub fn fetch_remote_branches(
     runner: &dyn CommandRunner,
     repo: &Path,
     remote: &str,
     branches: impl IntoIterator<Item = String>,
     branch_prefixes: impl IntoIterator<Item = String>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
+    fetch_remote_branches_with(
+        runner,
+        &Git2LocalRefs { repo },
+        repo,
+        remote,
+        branches,
+        branch_prefixes,
+    )
+}
+
+fn fetch_remote_branches_with(
+    runner: &dyn CommandRunner,
+    local_refs: &dyn LocalRefs,
+    repo: &Path,
+    remote: &str,
+    branches: impl IntoIterator<Item = String>,
+    branch_prefixes: impl IntoIterator<Item = String>,
+) -> Result<Vec<String>, String> {
     let refs = remote_branch_refs(remote, branches);
     let prefix_refs: Vec<_> = branch_prefixes
         .into_iter()
@@ -72,7 +140,7 @@ pub fn fetch_remote_branches(
         })
         .collect();
     if refs.is_empty() && prefix_refs.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let mut ls_args = vec![
@@ -84,61 +152,101 @@ pub fn fetch_remote_branches(
     ];
     ls_args.extend(refs.iter().map(|(source, _)| source.clone()));
     ls_args.extend(prefix_refs.iter().map(|(source, _)| source.clone()));
-    let advertised: BTreeSet<_> = run_owned(runner, repo, &ls_args)?
+    let advertised: BTreeMap<_, _> = run_owned(runner, repo, &ls_args)?
         .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .map(str::to_owned)
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+        })
+        .map(|(oid, reference)| (reference, oid))
         .collect();
+
+    let mut wanted = BTreeMap::new();
+    for (source, destination) in &refs {
+        if let Some(oid) = advertised.get(source) {
+            wanted.insert(destination.clone(), (source.clone(), oid.clone()));
+        }
+    }
+    for (source_pattern, destination_pattern) in &prefix_refs {
+        let source_root = source_pattern.trim_end_matches('*');
+        let destination_root = destination_pattern.trim_end_matches('*');
+        for (source, oid) in advertised
+            .iter()
+            .filter(|(source, _)| source.starts_with(source_root))
+        {
+            let destination = format!("{destination_root}{}", &source[source_root.len()..]);
+            wanted.insert(destination, (source.clone(), oid.clone()));
+        }
+    }
+    let exact_destinations: Vec<_> = refs
+        .iter()
+        .map(|(_, destination)| destination.clone())
+        .collect();
+    let prefix_destinations: Vec<_> = prefix_refs
+        .iter()
+        .map(|(_, destination)| destination.clone())
+        .collect();
+    let local_targets = local_refs.targets(&exact_destinations, &prefix_destinations)?;
 
     let mut fetch_args = vec![
         "fetch".into(),
         "--no-tags".into(),
         "--no-write-fetch-head".into(),
     ];
-    if !prefix_refs.is_empty() {
-        fetch_args.push("--prune".into());
-    }
     fetch_args.extend(["--end-of-options".into(), remote.into()]);
     let fixed_arg_count = fetch_args.len();
-    fetch_args.extend(
-        refs.iter()
-            .filter(|(source, _)| advertised.contains(source))
-            .filter(|(source, _)| {
-                !prefix_refs
-                    .iter()
-                    .any(|(prefix, _)| source.starts_with(prefix.trim_end_matches('*')))
-            })
-            .map(|(source, destination)| format!("+{source}:{destination}")),
-    );
-    fetch_args.extend(
-        prefix_refs
-            .iter()
-            .map(|(source, destination)| format!("+{source}:{destination}")),
-    );
+    fetch_args.extend(changed_refspecs(&wanted, &local_targets));
     if fetch_args.len() > fixed_arg_count {
         run_owned(runner, repo, &fetch_args)?;
     }
 
-    let deletes = refs
+    let mut missing: BTreeSet<_> = refs
         .iter()
-        .filter(|(source, _)| !advertised.contains(source))
-        .filter(|(source, _)| {
-            !prefix_refs
-                .iter()
-                .any(|(prefix, _)| source.starts_with(prefix.trim_end_matches('*')))
-        })
-        .map(|(_, destination)| format!("delete {destination}\n"))
-        .collect::<String>();
-    if !deletes.is_empty() {
-        run_input(
-            runner,
-            repo,
-            &["update-ref".into(), "--stdin".into()],
-            &deletes,
-            &BTreeMap::new(),
-        )?;
+        .filter(|(source, _)| !advertised.contains_key(source))
+        .map(|(_, destination)| destination.clone())
+        .collect();
+    for (source_pattern, destination_pattern) in &prefix_refs {
+        let source_root = source_pattern.trim_end_matches('*');
+        let destination_root = destination_pattern.trim_end_matches('*');
+        for destination in local_targets
+            .keys()
+            .filter(|destination| destination.starts_with(destination_root))
+        {
+            let source = format!("{source_root}{}", &destination[destination_root.len()..]);
+            if !advertised.contains_key(&source) {
+                missing.insert(destination.clone());
+            }
+        }
     }
-    Ok(())
+    Ok(missing.into_iter().collect())
+}
+
+pub fn delete_refs(repo: &Path, references: &[String]) -> Result<(), String> {
+    let repository =
+        git2::Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    let existing: Vec<_> = references
+        .iter()
+        .filter(|name| repository.find_reference(name).is_ok())
+        .collect();
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let mut transaction = repository
+        .transaction()
+        .map_err(|error| error.message().to_owned())?;
+    for name in &existing {
+        transaction
+            .lock_ref(name)
+            .map_err(|error| error.message().to_owned())?;
+    }
+    for name in existing {
+        transaction
+            .remove(name)
+            .map_err(|error| error.message().to_owned())?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| error.message().to_owned())
 }
 
 pub fn push_atomic(
@@ -165,6 +273,25 @@ pub fn push_atomic(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    impl LocalRefs for BTreeMap<String, String> {
+        fn targets(
+            &self,
+            exact: &[String],
+            prefixes: &[String],
+        ) -> Result<BTreeMap<String, String>, String> {
+            Ok(self
+                .iter()
+                .filter(|(name, _)| {
+                    exact.contains(name)
+                        || prefixes
+                            .iter()
+                            .any(|prefix| name.starts_with(prefix.trim_end_matches('*')))
+                })
+                .map(|(name, oid)| (name.clone(), oid.clone()))
+                .collect())
+        }
+    }
 
     #[derive(Default)]
     struct Runner {
@@ -194,10 +321,11 @@ mod tests {
     }
 
     #[test]
-    fn targeted_fetch_constructs_exact_refspecs_and_deletes_only_missing_refs() {
+    fn targeted_fetch_constructs_exact_refspecs_and_reports_only_missing_refs() {
         let runner = Runner::default();
-        fetch_remote_branches(
+        let missing = fetch_remote_branches_with(
             &runner,
+            &BTreeMap::new(),
             Path::new("."),
             "upstream",
             [
@@ -211,7 +339,7 @@ mod tests {
         .unwrap();
 
         let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 2);
         assert_eq!(
             calls[0].0,
             [
@@ -237,25 +365,25 @@ mod tests {
                 "+refs/heads/main:refs/remotes/upstream/main",
             ]
         );
-        assert_eq!(calls[2].0, ["update-ref", "--stdin"]);
-        assert_eq!(
-            calls[2].1.as_deref(),
-            Some("delete refs/remotes/upstream/fs-base/topic/1\n")
-        );
+        assert_eq!(missing, ["refs/remotes/upstream/fs-base/topic/1"]);
     }
 
     #[test]
     fn targeted_fetch_with_no_branches_runs_no_commands() {
         let runner = Runner::default();
-        fetch_remote_branches(&runner, Path::new("."), "origin", [], []).unwrap();
+        let missing =
+            fetch_remote_branches_with(&runner, &BTreeMap::new(), Path::new("."), "origin", [], [])
+                .unwrap();
         assert!(runner.calls.lock().unwrap().is_empty());
+        assert!(missing.is_empty());
     }
 
     #[test]
-    fn targeted_fetch_constructs_a_pruned_identity_prefix_refspec() {
+    fn targeted_fetch_expands_identity_prefixes_to_exact_refspecs() {
         let runner = Runner::default();
-        fetch_remote_branches(
+        fetch_remote_branches_with(
             &runner,
+            &BTreeMap::new(),
             Path::new("."),
             "origin",
             ["main".into(), "fs-head/topic/1".into()],
@@ -284,12 +412,33 @@ mod tests {
                 "fetch",
                 "--no-tags",
                 "--no-write-fetch-head",
-                "--prune",
                 "--end-of-options",
                 "origin",
+                "+refs/heads/fs-head/topic/1:refs/remotes/origin/fs-head/topic/1",
                 "+refs/heads/main:refs/remotes/origin/main",
-                "+refs/heads/fs-head/topic/*:refs/remotes/origin/fs-head/topic/*",
             ]
         );
+    }
+
+    #[test]
+    fn unchanged_tracking_refs_run_ls_remote_without_fetch() {
+        let runner = Runner::default();
+        let local = BTreeMap::from([
+            ("refs/remotes/origin/fs-head/topic/1".into(), "aaaa".into()),
+            ("refs/remotes/origin/main".into(), "bbbb".into()),
+        ]);
+        let missing = fetch_remote_branches_with(
+            &runner,
+            &local,
+            Path::new("."),
+            "origin",
+            ["main".into(), "fs-head/topic/1".into()],
+            [],
+        )
+        .unwrap();
+        assert!(missing.is_empty());
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0[0], "ls-remote");
     }
 }
