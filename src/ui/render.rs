@@ -39,14 +39,7 @@ pub fn commit_label(commit: &Commit, head_branch: Option<&str>) -> String {
     } else {
         format!(" ({})", labels.join(", "))
     };
-    let preview = if commit.preview { " [preview]" } else { "" };
-    format!(
-        "{}{}{} {}",
-        short_id(&commit.id),
-        decoration,
-        preview,
-        commit.subject
-    )
+    format!("{}{} {}", short_id(&commit.id), decoration, commit.subject)
 }
 
 pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
@@ -107,5 +100,26 @@ mod tests {
         assert!(label.contains("HEAD -> main"));
         assert!(label.contains("aaa-marker"));
         assert_eq!(label.matches("main").count(), 1);
+    }
+
+    #[test]
+    fn preview_uses_styling_without_label_suffix() {
+        let commit = Commit {
+            id: "preview:abcdef012345".into(),
+            subject: "subject".into(),
+            preview: true,
+            ..Commit::default()
+        };
+        let graph = Graph {
+            commits: [(commit.id.clone(), commit.clone())].into(),
+            order: vec![commit.id.clone()],
+            ..Graph::default()
+        };
+
+        assert_eq!(commit_label(&commit, None), "abcdef01 subject");
+        let rendered = render_graph(&graph);
+        assert!(rendered[0].preview);
+        assert!(rendered[0].text.contains('◆'));
+        assert!(!rendered[0].text.contains("[preview]"));
     }
 }

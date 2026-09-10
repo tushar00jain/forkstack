@@ -89,7 +89,33 @@ impl Graph {
             commit.local_refs.sort();
             commit.remote_refs.sort();
         }
+        graph.retain_reachable();
         Ok(graph)
+    }
+
+    fn retain_reachable(&mut self) {
+        let mut pending = vec![self.head.clone()];
+        pending.extend(
+            self.commits
+                .values()
+                .filter(|commit| {
+                    !commit.local_refs.is_empty()
+                        || !commit.remote_refs.is_empty()
+                        || !commit.tags.is_empty()
+                })
+                .map(|commit| commit.id.clone()),
+        );
+        let mut reachable = HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !reachable.insert(id.clone()) {
+                continue;
+            }
+            if let Some(commit) = self.commits.get(&id) {
+                pending.extend(commit.parents.iter().cloned());
+            }
+        }
+        self.commits.retain(|id, _| reachable.contains(id));
+        self.order.retain(|id| reachable.contains(id));
     }
 
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> bool {
@@ -636,6 +662,42 @@ mod tests {
                 .remote_refs
                 .contains(&"origin/fs-base/test/1".into())
         );
+    }
+
+    #[test]
+    fn publish_preview_omits_commits_abandoned_by_moved_remote_ref() {
+        let mut graph = graph();
+        graph.commits.insert(
+            "remote-old".into(),
+            Commit {
+                id: "remote-old".into(),
+                parents: vec!["a".into()],
+                subject: "old remote commit".into(),
+                remote_refs: vec!["origin/fs-base/test/1".into()],
+                ..Commit::default()
+            },
+        );
+        graph.order.insert(0, "remote-old".into());
+        let plan = SubmitPlan {
+            options: crate::core::submit::SubmitOptions {
+                remote: "origin".into(),
+                ..crate::core::submit::SubmitOptions::default()
+            },
+            fork: "example/repo".into(),
+            base_ref: "origin/main".into(),
+            commits: Vec::new(),
+            updates: vec![crate::core::submit::RefUpdate {
+                branch: "fs-base/test/1".into(),
+                rev: "b".into(),
+            }],
+        };
+
+        let preview = graph.publish_preview(&plan).unwrap();
+
+        assert!(!preview.commits.contains_key("remote-old"));
+        assert!(!preview.order.contains(&"remote-old".to_owned()));
+        assert!(preview.commits.contains_key("a"));
+        assert!(preview.order.contains(&"a".to_owned()));
     }
 
     #[test]
