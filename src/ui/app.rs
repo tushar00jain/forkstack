@@ -15,7 +15,6 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -131,26 +130,6 @@ fn hyperlink_sequence(url: &str, text: &str) -> Option<String> {
         .then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
 }
 
-fn underline_links(buffer: &mut Buffer, area: Rect, lines: &[RenderedLine]) {
-    for (row, line) in lines.iter().enumerate() {
-        let y = area.y.saturating_add(row as u16);
-        if y >= area.bottom() {
-            break;
-        }
-        for link in &line.links {
-            let x = area.x.saturating_add(link.start as u16);
-            if x >= area.right() {
-                continue;
-            }
-            let visible = link.width.min((area.right() - x) as usize);
-            for offset in 0..visible {
-                buffer[(x + offset as u16, y)]
-                    .set_style(Style::default().add_modifier(Modifier::UNDERLINED));
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 struct TerminalLink {
     x: u16,
@@ -178,7 +157,6 @@ fn write_terminal_links(writer: &mut impl Write, links: &[TerminalLink]) -> io::
         }
         queue!(
             writer,
-            SetAttribute(TerminalAttribute::Underlined),
             Print(sequence),
             SetAttribute(TerminalAttribute::Reset),
             SetColors(Colors::new(TerminalColor::Reset, TerminalColor::Reset))
@@ -689,7 +667,6 @@ impl App {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines).block(Block::default()), graph_area);
-            underline_links(frame.buffer_mut(), graph_area, &visible);
             for (row, line) in visible.iter().enumerate() {
                 let style = graph_line_style(line, selected.as_ref(), &carried_commits);
                 for link in &line.links {
@@ -913,41 +890,6 @@ mod tests {
     }
 
     #[test]
-    fn hyperlink_rendering_underlines_cells_without_embedding_escape_sequences() {
-        let area = Rect::new(0, 0, 40, 1);
-        let mut buffer = Buffer::empty(area);
-        buffer.set_string(0, 0, "xxorigin/fs-head/topic/1", Style::default());
-        let lines = vec![RenderedLine {
-            text: "xxorigin/fs-head/topic/1".into(),
-            commit: Some("commit".into()),
-            preview: false,
-            conflict: false,
-            links: vec![crate::ui::render::RenderedLink {
-                start: 2,
-                width: 22,
-                text: "origin/fs-head/topic/1".into(),
-                url: "https://example.invalid/1".into(),
-            }],
-        }];
-
-        underline_links(&mut buffer, area, &lines);
-
-        assert_eq!(buffer[(2, 0)].symbol(), "o");
-        assert!(
-            buffer[(2, 0)]
-                .style()
-                .add_modifier
-                .contains(Modifier::UNDERLINED)
-        );
-        assert!(
-            buffer[(23, 0)]
-                .style()
-                .add_modifier
-                .contains(Modifier::UNDERLINED)
-        );
-    }
-
-    #[test]
     fn terminal_hyperlink_wraps_the_whole_ref_once() {
         let mut output = Vec::new();
         write_terminal_links(
@@ -972,6 +914,7 @@ mod tests {
             output.matches("\x1b]8;;https://example.invalid/1").count(),
             1
         );
+        assert!(!output.contains("\x1b[4m"));
     }
 
     #[test]
