@@ -14,6 +14,22 @@ pub struct RenderedLink {
     pub url: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextKind {
+    CommitHash,
+    Head,
+    LocalRef,
+    RemoteRef,
+    Tag,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StyledRange {
+    pub start: usize,
+    pub end: usize,
+    pub kind: TextKind,
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderedLine {
     pub text: String,
@@ -21,6 +37,7 @@ pub struct RenderedLine {
     pub preview: bool,
     pub conflict: bool,
     pub links: Vec<RenderedLink>,
+    pub styles: Vec<StyledRange>,
 }
 
 fn short_id(id: &str) -> &str {
@@ -28,31 +45,109 @@ fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-pub fn commit_label(commit: &Commit, head_branch: Option<&str>) -> String {
-    let mut labels = Vec::new();
+fn push_styled(text: &mut String, styles: &mut Vec<StyledRange>, value: &str, kind: TextKind) {
+    let start = text.len();
+    text.push_str(value);
+    styles.push(StyledRange {
+        start,
+        end: text.len(),
+        kind,
+    });
+}
+
+fn commit_label_with_styles(
+    commit: &Commit,
+    head_branch: Option<&str>,
+) -> (String, Vec<StyledRange>) {
+    let mut text = String::new();
+    let mut styles = Vec::new();
+    push_styled(
+        &mut text,
+        &mut styles,
+        short_id(&commit.id),
+        TextKind::CommitHash,
+    );
+
+    let mut labels: Vec<(String, Vec<StyledRange>)> = Vec::new();
     if commit.is_head {
         if let Some(branch) = head_branch {
-            labels.push(format!("HEAD -> {branch}"));
+            let mut label = String::new();
+            let mut label_styles = Vec::new();
+            push_styled(&mut label, &mut label_styles, "HEAD", TextKind::Head);
+            label.push_str(" -> ");
+            push_styled(&mut label, &mut label_styles, branch, TextKind::LocalRef);
+            labels.push((label, label_styles));
         } else {
-            labels.push("HEAD".into());
+            labels.push((
+                "HEAD".into(),
+                vec![StyledRange {
+                    start: 0,
+                    end: 4,
+                    kind: TextKind::Head,
+                }],
+            ));
         }
     }
     for name in &commit.local_refs {
         if !commit.is_head || Some(name.as_str()) != head_branch {
-            labels.push(name.clone());
+            labels.push((
+                name.clone(),
+                vec![StyledRange {
+                    start: 0,
+                    end: name.len(),
+                    kind: TextKind::LocalRef,
+                }],
+            ));
         }
     }
-    labels.extend(commit.remote_refs.iter().cloned());
-    labels.extend(commit.tags.iter().map(|tag| format!("tag: {tag}")));
+    labels.extend(commit.remote_refs.iter().map(|name| {
+        (
+            name.clone(),
+            vec![StyledRange {
+                start: 0,
+                end: name.len(),
+                kind: TextKind::RemoteRef,
+            }],
+        )
+    }));
+    labels.extend(commit.tags.iter().map(|tag| {
+        let label = format!("tag: {tag}");
+        let end = label.len();
+        (
+            label,
+            vec![StyledRange {
+                start: 0,
+                end,
+                kind: TextKind::Tag,
+            }],
+        )
+    }));
     if let Some(conflict) = &commit.conflict {
-        labels.push(conflict.clone());
+        labels.push((conflict.clone(), Vec::new()));
     }
-    let decoration = if labels.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", labels.join(", "))
-    };
-    format!("{}{} {}", short_id(&commit.id), decoration, commit.subject)
+    if !labels.is_empty() {
+        text.push_str(" (");
+        for (index, (label, label_styles)) in labels.into_iter().enumerate() {
+            if index != 0 {
+                text.push_str(", ");
+            }
+            let offset = text.len();
+            text.push_str(&label);
+            styles.extend(label_styles.into_iter().map(|style| StyledRange {
+                start: offset + style.start,
+                end: offset + style.end,
+                kind: style.kind,
+            }));
+        }
+        text.push(')');
+    }
+    text.push(' ');
+    text.push_str(&commit.subject);
+    (text, styles)
+}
+
+pub fn commit_label(commit: &Commit, head_branch: Option<&str>) -> String {
+    commit_label_with_styles(commit, head_branch).0
 }
 
 pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
@@ -78,19 +173,32 @@ pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
         } else {
             "o"
         };
-        let row = renderer.next_row(
-            id.clone(),
-            parents,
-            glyph.into(),
-            commit_label(commit, graph.branch.as_deref()),
-        );
+        let (label, label_styles) = commit_label_with_styles(commit, graph.branch.as_deref());
+        let row = renderer.next_row(id.clone(), parents, glyph.into(), label.clone());
         for (index, text) in row.lines().enumerate() {
+            let styles = if index == 0 {
+                text.find(&label)
+                    .map(|offset| {
+                        label_styles
+                            .iter()
+                            .map(|style| StyledRange {
+                                start: offset + style.start,
+                                end: offset + style.end,
+                                kind: style.kind,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             lines.push(RenderedLine {
                 text: text.into(),
                 commit: (index == 0).then(|| id.clone()),
                 preview: commit.preview,
                 conflict: commit.conflict.is_some(),
                 links: Vec::new(),
+                styles,
             });
         }
     }
@@ -142,6 +250,45 @@ mod tests {
         assert!(label.contains("HEAD -> main"));
         assert!(label.contains("aaa-marker"));
         assert_eq!(label.matches("main").count(), 1);
+    }
+
+    #[test]
+    fn graph_marks_only_git_decoration_ranges_for_semantic_colors() {
+        let commit = Commit {
+            id: "abcdef012345".into(),
+            subject: "subject remains plain".into(),
+            local_refs: vec!["topic".into(), "main".into()],
+            remote_refs: vec!["origin/topic".into()],
+            tags: vec!["v1".into()],
+            is_head: true,
+            ..Commit::default()
+        };
+        let graph = Graph {
+            commits: [(commit.id.clone(), commit.clone())].into(),
+            order: vec![commit.id.clone()],
+            branch: Some("main".into()),
+            ..Graph::default()
+        };
+
+        let rendered = render_graph(&graph);
+        let styled = rendered[0]
+            .styles
+            .iter()
+            .map(|range| (&rendered[0].text[range.start..range.end], range.kind))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            styled,
+            [
+                ("abcdef01", TextKind::CommitHash),
+                ("HEAD", TextKind::Head),
+                ("main", TextKind::LocalRef),
+                ("topic", TextKind::LocalRef),
+                ("origin/topic", TextKind::RemoteRef),
+                ("tag: v1", TextKind::Tag),
+            ]
+        );
+        assert!(!styled.iter().any(|(text, _)| text.contains("subject")));
     }
 
     #[test]

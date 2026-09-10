@@ -26,7 +26,7 @@ use crate::ui::git::{
     LinkRequest, LinkResponse, Request, Response, displayed_remote_heads, link_worker, worker,
 };
 use crate::ui::model::{Graph, MovePlan};
-use crate::ui::render::{RenderedLine, attach_pr_links, commit_label, render_graph};
+use crate::ui::render::{RenderedLine, TextKind, attach_pr_links, commit_label, render_graph};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -188,6 +188,38 @@ fn graph_line_style(
         style = style.bg(Color::Rgb(64, 64, 64));
     }
     style
+}
+
+fn text_kind_style(mut base: Style, kind: TextKind) -> Style {
+    base = match kind {
+        TextKind::CommitHash | TextKind::Tag => base.fg(Color::Yellow),
+        TextKind::Head => base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        TextKind::LocalRef => base.fg(Color::Green),
+        TextKind::RemoteRef => base.fg(Color::Red),
+    };
+    base
+}
+
+fn styled_graph_line(line: &RenderedLine, base: Style) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut position = 0;
+    for range in &line.styles {
+        if position < range.start {
+            spans.push(Span::styled(
+                line.text[position..range.start].to_owned(),
+                base,
+            ));
+        }
+        spans.push(Span::styled(
+            line.text[range.start..range.end].to_owned(),
+            text_kind_style(base, range.kind),
+        ));
+        position = range.end;
+    }
+    if position < line.text.len() {
+        spans.push(Span::styled(line.text[position..].to_owned(), base));
+    }
+    Line::from(spans)
 }
 
 pub struct App {
@@ -660,8 +692,8 @@ impl App {
             let lines: Vec<Line> = visible
                 .iter()
                 .map(|line| {
-                    Line::styled(
-                        line.text.clone(),
+                    styled_graph_line(
+                        line,
                         graph_line_style(line, selected.as_ref(), &carried_commits),
                     )
                 })
@@ -681,7 +713,7 @@ impl App {
                         y,
                         text: link.text.chars().take(visible_width).collect(),
                         url: link.url.clone(),
-                        style,
+                        style: text_kind_style(style, TextKind::RemoteRef),
                     });
                 }
             }
@@ -877,6 +909,29 @@ mod tests {
         ] {
             assert!(help.contains(binding), "missing {binding} from {help}");
         }
+    }
+
+    #[test]
+    fn git_decoration_colors_match_the_requested_palette() {
+        let base = Style::default().bg(Color::Rgb(64, 64, 64));
+
+        assert_eq!(
+            text_kind_style(base, TextKind::CommitHash).fg,
+            Some(Color::Yellow)
+        );
+        let head = text_kind_style(base, TextKind::Head);
+        assert_eq!(head.fg, Some(Color::Cyan));
+        assert!(head.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            text_kind_style(base, TextKind::LocalRef).fg,
+            Some(Color::Green)
+        );
+        assert_eq!(
+            text_kind_style(base, TextKind::RemoteRef).fg,
+            Some(Color::Red)
+        );
+        assert_eq!(text_kind_style(base, TextKind::Tag).fg, Some(Color::Yellow));
+        assert_eq!(head.bg, base.bg);
     }
 
     #[test]
