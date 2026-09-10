@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{Oid, Repository, RepositoryState, Sort};
 
+use crate::integrations::ProcessRunner;
+use crate::integrations::github::{PullRequestLink, discover_pr_links};
 use crate::ui::model::{Commit, Graph, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
@@ -511,6 +513,91 @@ pub struct Response {
     pub operation_error: Option<String>,
 }
 
+#[derive(Debug)]
+pub enum LinkRequest {
+    Load { generation: u64, heads: Vec<String> },
+    Stop,
+}
+
+#[derive(Debug)]
+pub struct LinkResponse {
+    pub generation: u64,
+    pub result: Result<BTreeMap<String, PullRequestLink>, String>,
+}
+
+pub(crate) fn displayed_remote_heads(graph: &Graph, remote: &str) -> Vec<String> {
+    let prefix = format!("{remote}/fs-head/");
+    graph
+        .commits
+        .values()
+        .flat_map(|commit| &commit.remote_refs)
+        .filter_map(|name| {
+            name.strip_prefix(&prefix)
+                .map(|tail| format!("fs-head/{tail}"))
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn load_pr_links(
+    options: &crate::core::submit::SubmitOptions,
+    heads: &[String],
+) -> Result<BTreeMap<String, PullRequestLink>, String> {
+    if heads.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let fork = crate::core::submit::github_repository(&options.repo, &options.remote)?;
+    let found = discover_pr_links(&ProcessRunner, &options.repo, &fork, heads)?;
+    Ok(remote_pr_links(&options.remote, found))
+}
+
+pub fn link_worker(
+    options: crate::core::submit::SubmitOptions,
+    requests: Receiver<LinkRequest>,
+    responses: Sender<LinkResponse>,
+) {
+    while let Ok(request) = requests.recv() {
+        let LinkRequest::Load {
+            mut generation,
+            mut heads,
+        } = request
+        else {
+            break;
+        };
+        // If several graph generations arrived while the previous network
+        // request was running, skip directly to the newest presentation.
+        while let Ok(request) = requests.try_recv() {
+            match request {
+                LinkRequest::Load {
+                    generation: newer_generation,
+                    heads: newer_heads,
+                } => {
+                    generation = newer_generation;
+                    heads = newer_heads;
+                }
+                LinkRequest::Stop => return,
+            }
+        }
+        let result = load_pr_links(&options, &heads)
+            .map_err(|error| format!("PR links unavailable: {error}"));
+        if responses.send(LinkResponse { generation, result }).is_err() {
+            break;
+        }
+    }
+}
+
+fn remote_pr_links(
+    remote: &str,
+    found: BTreeMap<String, PullRequestLink>,
+) -> BTreeMap<String, PullRequestLink> {
+    found
+        .into_iter()
+        .filter(|(head, pr)| pr.head_ref_name == *head)
+        .map(|(head, pr)| (format!("{remote}/{head}"), pr))
+        .collect()
+}
+
 pub fn worker(
     options: crate::core::submit::SubmitOptions,
     requests: Receiver<Request>,
@@ -633,6 +720,74 @@ mod tests {
             "incoming, conflict (rebase: src/lib.rs)"
         );
         assert_eq!(conflict_label(&[], &[]), None);
+    }
+
+    #[test]
+    fn displayed_remote_heads_are_exact_configured_heads_and_deduplicated() {
+        let graph = Graph {
+            commits: [
+                (
+                    "a".into(),
+                    Commit {
+                        remote_refs: vec![
+                            "origin/fs-head/topic/2".into(),
+                            "upstream/fs-head/other/1".into(),
+                            "origin/fs-base/topic/3".into(),
+                            "origin/ordinary".into(),
+                        ],
+                        ..Commit::default()
+                    },
+                ),
+                (
+                    "b".into(),
+                    Commit {
+                        remote_refs: vec![
+                            "origin/fs-head/topic/1".into(),
+                            "origin/fs-head/topic/2".into(),
+                        ],
+                        ..Commit::default()
+                    },
+                ),
+            ]
+            .into(),
+            ..Graph::default()
+        };
+
+        assert_eq!(
+            displayed_remote_heads(&graph, "origin"),
+            ["fs-head/topic/1", "fs-head/topic/2"]
+        );
+    }
+
+    #[test]
+    fn pull_request_links_map_back_to_the_matching_remote_ref() {
+        let links = remote_pr_links(
+            "upstream",
+            [
+                (
+                    "fs-head/topic/1".into(),
+                    PullRequestLink {
+                        number: 1,
+                        head_ref_name: "fs-head/topic/1".into(),
+                        url: "https://example.invalid/1".into(),
+                    },
+                ),
+                (
+                    "fs-head/topic/2".into(),
+                    PullRequestLink {
+                        number: 2,
+                        head_ref_name: "fs-head/unexpected".into(),
+                        url: "https://example.invalid/2".into(),
+                    },
+                ),
+            ]
+            .into(),
+        );
+
+        assert_eq!(
+            links.keys().cloned().collect::<Vec<_>>(),
+            ["upstream/fs-head/topic/1"]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -11,15 +11,19 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::core::submit::{SubmitOptions, SubmitPlan};
-use crate::ui::git::{Request, Response, worker};
+use crate::integrations::github::PullRequestLink;
+use crate::ui::git::{
+    LinkRequest, LinkResponse, Request, Response, displayed_remote_heads, link_worker, worker,
+};
 use crate::ui::model::{Graph, MovePlan};
-use crate::ui::render::{RenderedLine, commit_label, render_graph};
+use crate::ui::render::{RenderedLine, attach_pr_links, commit_label, render_graph};
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -48,6 +52,107 @@ fn preserve_preview_while_navigating(publish_active: bool) -> bool {
     publish_active
 }
 
+fn help_transition(open: bool, key: &KeyEvent) -> Option<bool> {
+    if open {
+        Some(!matches!(key.code, KeyCode::Char('?') | KeyCode::Esc))
+    } else {
+        (key.code == KeyCode::Char('?')).then_some(true)
+    }
+}
+
+fn current_link_response(generation: u64, response: &LinkResponse) -> bool {
+    response.generation == generation
+}
+
+fn link_request(generation: u64, graph: &Graph, remote: &str) -> LinkRequest {
+    LinkRequest::Load {
+        generation,
+        heads: displayed_remote_heads(graph, remote),
+    }
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(area);
+    let [area] = Layout::vertical([Constraint::Length(height.min(area.height))])
+        .flex(Flex::Center)
+        .areas(area);
+    area
+}
+
+fn key_line<'a>(bindings: &'a [(&'a str, &'a str)]) -> Line<'a> {
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default().fg(Color::White);
+    let mut spans = Vec::new();
+    for (index, (key, label)) in bindings.iter().enumerate() {
+        if index != 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(*key, key_style));
+        spans.push(Span::styled(format!(" {label}"), label_style));
+    }
+    Line::from(spans)
+}
+
+fn compact_footer() -> Line<'static> {
+    key_line(&[
+        ("↑/↓", "select"),
+        ("Enter", "open"),
+        ("m/M", "move"),
+        ("a", "apply"),
+        ("p/P", "publish"),
+        ("?", "help"),
+        ("q", "quit"),
+    ])
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    vec![
+        key_line(&[("↑/↓ or j/k", "select previous/next commit")]),
+        key_line(&[("Enter", "checkout commit or preview pending move")]),
+        key_line(&[("m", "move commit"), ("M", "move substack")]),
+        key_line(&[("a", "apply move preview"), ("Esc", "cancel preview")]),
+        key_line(&[("p", "preview publish"), ("P", "execute publish")]),
+        key_line(&[("/", "search"), ("n/N", "next/previous match")]),
+        key_line(&[("r/R", "refresh graph and PR links")]),
+        key_line(&[("? or Esc", "close help"), ("q", "quit")]),
+    ]
+}
+
+fn hyperlink_symbol(url: &str, text: &str) -> Option<String> {
+    (!url.chars().any(char::is_control)).then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
+}
+
+fn apply_hyperlinks(buffer: &mut Buffer, area: Rect, lines: &[RenderedLine]) {
+    for (row, line) in lines.iter().enumerate() {
+        let y = area.y.saturating_add(row as u16);
+        if y >= area.bottom() {
+            break;
+        }
+        for link in &line.links {
+            let x = area.x.saturating_add(link.start as u16);
+            if x >= area.right() {
+                continue;
+            }
+            let visible = link.width.min((area.right() - x) as usize);
+            for offset in 0..visible {
+                buffer[(x + offset as u16, y)]
+                    .set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+            }
+            let characters: Vec<_> = link.text.chars().take(visible).collect();
+            for (chunk, pair) in characters.chunks(2).enumerate() {
+                let pair: String = pair.iter().collect();
+                if let Some(symbol) = hyperlink_symbol(&link.url, &pair) {
+                    buffer[(x + (chunk * 2) as u16, y)].set_symbol(&symbol);
+                }
+            }
+        }
+    }
+}
+
 pub struct App {
     graph: Option<Graph>,
     preview: Option<Graph>,
@@ -64,9 +169,15 @@ pub struct App {
     busy: Option<Busy>,
     requests: Sender<Request>,
     responses: Receiver<Response>,
+    link_requests: Sender<LinkRequest>,
+    link_responses: Receiver<LinkResponse>,
+    link_generation: u64,
+    link_status: Option<String>,
     quit: bool,
     scroll: usize,
     rendered: Vec<RenderedLine>,
+    pr_links: BTreeMap<String, PullRequestLink>,
+    help_open: bool,
     dirty: bool,
 }
 
@@ -76,6 +187,10 @@ impl App {
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
         thread::spawn(move || worker(worker_options, request_rx, response_tx));
+        let link_worker_options = publish_options.clone();
+        let (link_request_tx, link_request_rx) = mpsc::channel();
+        let (link_response_tx, link_response_rx) = mpsc::channel();
+        thread::spawn(move || link_worker(link_worker_options, link_request_rx, link_response_tx));
         let app = Self {
             graph: None,
             preview: None,
@@ -92,9 +207,15 @@ impl App {
             busy: Some(Busy::Load),
             requests: request_tx,
             responses: response_rx,
+            link_requests: link_request_tx,
+            link_responses: link_response_rx,
+            link_generation: 0,
+            link_status: None,
             quit: false,
             scroll: 0,
             rendered: Vec::new(),
+            pr_links: BTreeMap::new(),
+            help_open: false,
             dirty: true,
         };
         let _ = app.requests.send(Request::Load);
@@ -112,8 +233,29 @@ impl App {
     }
 
     fn update_rendered(&mut self) {
-        self.rendered = self.active_graph().map(render_graph).unwrap_or_default();
+        let rendered = self
+            .active_graph()
+            .map(|graph| {
+                let mut rendered = render_graph(graph);
+                attach_pr_links(&mut rendered, graph, &self.pr_links);
+                rendered
+            })
+            .unwrap_or_default();
+        self.rendered = rendered;
         self.dirty = true;
+    }
+
+    fn request_pr_links(&mut self) {
+        self.link_generation = self.link_generation.wrapping_add(1);
+        self.pr_links.clear();
+        self.link_status = None;
+        if let Some(graph) = self.active_graph() {
+            let _ = self.link_requests.send(link_request(
+                self.link_generation,
+                graph,
+                &self.publish_options.remote,
+            ));
+        }
     }
 
     fn clear_preview(&mut self, keep_carried: bool) {
@@ -256,7 +398,7 @@ impl App {
             return;
         }
         let Some(plan) = self.publish_plan.clone() else {
-            self.status = Some("press f to preview publish changes first".into());
+            self.status = Some("press p to preview publish changes first".into());
             self.status_error = true;
             return;
         };
@@ -327,6 +469,10 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if let Some(open) = help_transition(self.help_open, &key) {
+            self.help_open = open;
+            return;
+        }
         if self.search.editing {
             self.handle_search_key(key);
             return;
@@ -340,8 +486,8 @@ impl App {
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
             (KeyCode::Char('a'), _) => self.apply(),
-            (KeyCode::Char('f'), _) => self.preview_publish(),
-            (KeyCode::Char('F'), _) => self.execute_publish(),
+            (KeyCode::Char('p'), _) => self.preview_publish(),
+            (KeyCode::Char('P'), _) => self.execute_publish(),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -386,12 +532,44 @@ impl App {
                         .or_else(|| ids.first().cloned());
                     self.status_error = response.operation_error.is_some();
                     self.status = response.operation_error;
+                    self.request_pr_links();
                     self.update_rendered();
                 }
                 Err(error) => {
+                    self.link_generation = self.link_generation.wrapping_add(1);
+                    self.pr_links.clear();
+                    self.link_status = None;
                     self.status = Some(response.operation_error.unwrap_or(error));
                     self.status_error = true;
                     self.dirty = true;
+                }
+            }
+        }
+        while let Ok(response) = self.link_responses.try_recv() {
+            if !current_link_response(self.link_generation, &response) {
+                continue;
+            }
+            match response.result {
+                Ok(links) => {
+                    self.pr_links = links;
+                    if self
+                        .link_status
+                        .as_ref()
+                        .is_some_and(|message| self.status.as_ref() == Some(message))
+                    {
+                        self.status = None;
+                    }
+                    self.link_status = None;
+                    self.update_rendered();
+                }
+                Err(error) => {
+                    self.pr_links.clear();
+                    if self.status.is_none() {
+                        self.status = Some(error.clone());
+                        self.status_error = false;
+                        self.link_status = Some(error);
+                    }
+                    self.update_rendered();
                 }
             }
         }
@@ -402,6 +580,7 @@ impl App {
         let selected = self.selected.clone();
         let carried_commits = self.carried_commits.clone();
         let status_error = self.status_error;
+        let help_open = self.help_open;
         terminal.draw(|frame| {
             let [graph_area, message_area, footer_area] = Layout::vertical([
                 Constraint::Min(1),
@@ -419,10 +598,14 @@ impl App {
             } else if selected_row >= self.scroll.saturating_add(height) {
                 self.scroll = selected_row.saturating_sub(height.saturating_sub(1));
             }
-            let lines: Vec<Line> = rendered
+            let visible: Vec<RenderedLine> = rendered
                 .iter()
                 .skip(self.scroll)
                 .take(height)
+                .cloned()
+                .collect();
+            let lines: Vec<Line> = visible
+                .iter()
                 .map(|line| {
                     let mut style = Style::default();
                     if line.preview {
@@ -445,6 +628,7 @@ impl App {
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines).block(Block::default()), graph_area);
+            apply_hyperlinks(frame.buffer_mut(), graph_area, &visible);
 
             let message = if self.search.editing {
                 Line::from(vec![
@@ -467,35 +651,21 @@ impl App {
             };
             frame.render_widget(Paragraph::new(message).style(message_style), message_area);
 
-            let key_style = Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD);
-            let label_style = Style::default().fg(Color::White);
-            let footer = Line::from(vec![
-                Span::styled("↑/↓", key_style),
-                Span::styled(" select  ", label_style),
-                Span::styled("Enter", key_style),
-                Span::styled(" checkout/preview  ", label_style),
-                Span::styled("m", key_style),
-                Span::styled(" move commit  ", label_style),
-                Span::styled("M", key_style),
-                Span::styled(" move substack  ", label_style),
-                Span::styled("a", key_style),
-                Span::styled(" apply  ", label_style),
-                Span::styled("f/F", key_style),
-                Span::styled(" publish preview/run  ", label_style),
-                Span::styled("Esc", key_style),
-                Span::styled(" cancel  ", label_style),
-                Span::styled("/", key_style),
-                Span::styled(" search  ", label_style),
-                Span::styled("n/N", key_style),
-                Span::styled(" next/prev  ", label_style),
-                Span::styled("R", key_style),
-                Span::styled(" refresh  ", label_style),
-                Span::styled("q", key_style),
-                Span::styled(" quit", label_style),
-            ]);
-            frame.render_widget(Paragraph::new(footer), footer_area);
+            frame.render_widget(Paragraph::new(compact_footer()), footer_area);
+
+            if help_open {
+                let area = centered(frame.area(), 62, 12);
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    Paragraph::new(help_lines()).block(
+                        Block::default()
+                            .title(" Help ")
+                            .borders(Borders::ALL)
+                            .style(Style::default().bg(Color::Rgb(24, 24, 24))),
+                    ),
+                    area,
+                );
+            }
         })?;
         Ok(())
     }
@@ -528,6 +698,7 @@ impl App {
             Ok(())
         })();
         let _ = self.requests.send(Request::Stop);
+        let _ = self.link_requests.send(LinkRequest::Stop);
         let _ = disable_raw_mode();
         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
         let _ = terminal.show_cursor();
@@ -563,5 +734,133 @@ mod tests {
     fn navigation_preserves_only_publish_previews() {
         assert!(preserve_preview_while_navigating(true));
         assert!(!preserve_preview_while_navigating(false));
+    }
+
+    #[test]
+    fn help_is_modal_and_toggles_with_question_mark_or_escape() {
+        let question = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let action = KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert_eq!(help_transition(false, &question), Some(true));
+        assert_eq!(help_transition(true, &action), Some(true));
+        assert_eq!(help_transition(true, &question), Some(false));
+        assert_eq!(help_transition(true, &escape), Some(false));
+        assert_eq!(help_transition(false, &action), None);
+    }
+
+    #[test]
+    fn footer_is_compact_and_full_key_map_lives_in_help() {
+        let footer = compact_footer().to_string();
+        assert!(footer.contains("p/P publish"));
+        assert!(footer.contains("? help"));
+        assert!(footer.contains("q quit"));
+        assert!(!footer.contains("search"));
+
+        let help = help_lines()
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for binding in [
+            "m move commit",
+            "P execute publish",
+            "/ search",
+            "r/R refresh",
+        ] {
+            assert!(help.contains(binding), "missing {binding} from {help}");
+        }
+    }
+
+    #[test]
+    fn osc_hyperlink_representation_rejects_control_characters() {
+        assert_eq!(
+            hyperlink_symbol("https://example.invalid/1", "or"),
+            Some("\x1b]8;;https://example.invalid/1\x07or\x1b]8;;\x07".into())
+        );
+        assert!(hyperlink_symbol("https://example.invalid/\x1b", "or").is_none());
+    }
+
+    #[test]
+    fn hyperlink_rendering_underlines_the_existing_cells_and_embeds_osc_8() {
+        let area = Rect::new(0, 0, 40, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(0, 0, "xxorigin/fs-head/topic/1", Style::default());
+        let lines = vec![RenderedLine {
+            text: "xxorigin/fs-head/topic/1".into(),
+            commit: Some("commit".into()),
+            preview: false,
+            conflict: false,
+            links: vec![crate::ui::render::RenderedLink {
+                start: 2,
+                width: 22,
+                text: "origin/fs-head/topic/1".into(),
+                url: "https://example.invalid/1".into(),
+            }],
+        }];
+
+        apply_hyperlinks(&mut buffer, area, &lines);
+
+        assert!(buffer[(2, 0)].symbol().starts_with("\x1b]8;;"));
+        assert!(
+            buffer[(2, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(
+            buffer[(23, 0)]
+                .style()
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn stale_link_generations_are_rejected() {
+        let stale = LinkResponse {
+            generation: 4,
+            result: Ok(BTreeMap::new()),
+        };
+        let current = LinkResponse {
+            generation: 5,
+            result: Ok(BTreeMap::new()),
+        };
+
+        assert!(!current_link_response(5, &stale));
+        assert!(current_link_response(5, &current));
+    }
+
+    #[test]
+    fn link_request_payload_contains_only_deduplicated_head_names() {
+        let graph = Graph {
+            commits: [
+                (
+                    "a".into(),
+                    crate::ui::model::Commit {
+                        remote_refs: vec![
+                            "origin/fs-head/topic/1".into(),
+                            "origin/fs-base/topic/2".into(),
+                        ],
+                        ..crate::ui::model::Commit::default()
+                    },
+                ),
+                (
+                    "b".into(),
+                    crate::ui::model::Commit {
+                        remote_refs: vec!["origin/fs-head/topic/1".into()],
+                        ..crate::ui::model::Commit::default()
+                    },
+                ),
+            ]
+            .into(),
+            ..Graph::default()
+        };
+
+        let LinkRequest::Load { generation, heads } = link_request(9, &graph, "origin") else {
+            panic!("expected a load request");
+        };
+        assert_eq!(generation, 9);
+        assert_eq!(heads, ["fs-head/topic/1"]);
     }
 }

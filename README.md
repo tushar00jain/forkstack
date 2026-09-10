@@ -38,10 +38,11 @@ forkstack log --no-remotes -n 20
 | `Enter` | Check out or preview a move |
 | `m` / `M` | Move one commit / a substack |
 | `a` | Apply a move preview |
-| `f` / `F` | Preview / execute a publish |
+| `p` / `P` | Preview / execute a publish |
 | `Esc` | Cancel a preview |
 | `/`, `n`, `N` | Search / next / previous |
-| `R` | Refresh |
+| `r` / `R` | Refresh graph and PR links |
+| `?` | Show the complete key map |
 | `q` | Quit |
 
 ### Fixture

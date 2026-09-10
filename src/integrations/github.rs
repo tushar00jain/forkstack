@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use super::CommandRunner;
 
@@ -24,6 +25,14 @@ pub struct PullRequestDiscovery {
     pub by_head: BTreeMap<String, PullRequest>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PullRequestLink {
+    pub number: u64,
+    pub head_ref_name: String,
+    pub url: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatePullRequest<'a> {
     pub base: &'a str,
@@ -41,28 +50,33 @@ pub struct EditPullRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct DiscoveryResponse {
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct RepositoryQueryResponse<T> {
     #[serde(default)]
-    data: Option<DiscoveryData>,
+    data: Option<RepositoryQueryData<T>>,
     #[serde(default)]
     errors: Vec<GraphqlError>,
 }
 
 #[derive(Deserialize)]
-struct DiscoveryData {
-    repository: DiscoveryRepository,
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct RepositoryQueryData<T> {
+    repository: RepositoryQueries<T>,
 }
 
 #[derive(Deserialize)]
-struct DiscoveryRepository {
-    id: String,
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct RepositoryQueries<T> {
+    #[serde(default)]
+    id: Option<String>,
     #[serde(flatten)]
-    queries: BTreeMap<String, PullRequestNodes>,
+    queries: BTreeMap<String, PullRequestNodes<T>>,
 }
 
 #[derive(Deserialize)]
-struct PullRequestNodes {
-    nodes: Vec<PullRequest>,
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+struct PullRequestNodes<T> {
+    nodes: Vec<T>,
 }
 
 #[derive(Deserialize)]
@@ -132,12 +146,14 @@ fn run_graphql(
     )
 }
 
-pub fn discover_prs(
+fn query_open_prs<T: DeserializeOwned>(
     runner: &dyn CommandRunner,
     repo: &Path,
     fork: &str,
     branches: &[String],
-) -> Result<PullRequestDiscovery, String> {
+    repository_fields: &str,
+    pull_request_fields: &str,
+) -> Result<RepositoryQueries<T>, String> {
     let (owner, name) = fork
         .split_once('/')
         .ok_or_else(|| format!("invalid GitHub repository {fork:?}"))?;
@@ -146,22 +162,38 @@ pub fn discover_prs(
         .enumerate()
         .map(|(index, branch)| {
             format!(
-                "p{index}:pullRequests(first:2,states:OPEN,headRefName:{},orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{id number baseRefName headRefName title body isDraft url}}}}",
+                "p{index}:pullRequests(first:2,states:OPEN,headRefName:{},orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{{pull_request_fields}}}}}",
                 graphql_string(branch)
             )
         })
         .collect::<String>();
     let query = format!(
-        "query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{id {selections}}}}}"
+        "query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{repository_fields} {selections}}}}}"
     );
     let out = run_graphql(runner, repo, query, &[("owner", owner), ("name", name)])?;
-    let response: DiscoveryResponse = serde_json::from_str(&out)
+    let response: RepositoryQueryResponse<T> = serde_json::from_str(&out)
         .map_err(|error| format!("could not parse gh output: {error}"))?;
     ensure_no_graphql_errors(&response.errors)?;
-    let repository = response
+    Ok(response
         .data
         .ok_or("gh output omitted GraphQL data")?
-        .repository;
+        .repository)
+}
+
+pub fn discover_prs(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    fork: &str,
+    branches: &[String],
+) -> Result<PullRequestDiscovery, String> {
+    let repository = query_open_prs::<PullRequest>(
+        runner,
+        repo,
+        fork,
+        branches,
+        "id",
+        "id number baseRefName headRefName title body isDraft url",
+    )?;
     let mut by_head = BTreeMap::new();
     for (index, branch) in branches.iter().enumerate() {
         let mut nodes = repository
@@ -175,9 +207,40 @@ pub fn discover_prs(
         }
     }
     Ok(PullRequestDiscovery {
-        repository_id: repository.id,
+        repository_id: repository.id.ok_or("gh output omitted repository id")?,
         by_head,
     })
+}
+
+pub fn discover_pr_links(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    fork: &str,
+    branches: &[String],
+) -> Result<BTreeMap<String, PullRequestLink>, String> {
+    if branches.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let repository = query_open_prs::<PullRequestLink>(
+        runner,
+        repo,
+        fork,
+        branches,
+        "",
+        "number headRefName url",
+    )?;
+    let mut by_head = BTreeMap::new();
+    for (index, branch) in branches.iter().enumerate() {
+        let nodes = &repository
+            .queries
+            .get(&format!("p{index}"))
+            .ok_or_else(|| format!("gh output omitted pull request query for {branch:?}"))?
+            .nodes;
+        if let Some(pr) = nodes.first() {
+            by_head.insert(branch.clone(), pr.clone());
+        }
+    }
+    Ok(by_head)
 }
 
 pub fn create_prs(
@@ -259,6 +322,7 @@ mod tests {
     struct Runner {
         output: String,
         calls: Mutex<Vec<Vec<String>>>,
+        inputs: Mutex<Vec<String>>,
     }
 
     impl CommandRunner for Runner {
@@ -267,11 +331,15 @@ mod tests {
             program: &str,
             args: &[String],
             _repo: &Path,
-            _input: Option<&str>,
+            input: Option<&str>,
             _env: &BTreeMap<String, String>,
         ) -> Result<String, String> {
             assert_eq!(program, "gh");
             self.calls.lock().unwrap().push(args.to_vec());
+            self.inputs
+                .lock()
+                .unwrap()
+                .push(input.unwrap_or_default().to_owned());
             Ok(self.output.clone())
         }
     }
@@ -300,6 +368,7 @@ mod tests {
             })
             .to_string(),
             calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         };
         let branches = vec![
             "fs-head/topic/1".into(),
@@ -312,10 +381,43 @@ mod tests {
     }
 
     #[test]
+    fn link_discovery_uses_the_shared_lightweight_batch_query() {
+        let runner = Runner {
+            output: serde_json::json!({
+                "data": {"repository": {
+                    "p0": {"nodes": [{
+                        "number": 7,
+                        "headRefName": "fs-head/topic/1",
+                        "url": "https://example.invalid/7"
+                    }]},
+                    "p1": {"nodes": []}
+                }}
+            })
+            .to_string(),
+            calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        };
+        let branches = vec!["fs-head/topic/1".into(), "fs-head/topic/2".into()];
+        let found = discover_pr_links(&runner, Path::new("."), "owner/repo", &branches).unwrap();
+
+        assert_eq!(found["fs-head/topic/1"].number, 7);
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
+        let input = runner.inputs.lock().unwrap()[0].clone();
+        assert!(input.contains("number headRefName url"), "{input}");
+        for excluded in ["body", "title", "baseRefName", "isDraft", "repositoryId"] {
+            assert!(
+                !input.contains(excluded),
+                "unexpected {excluded} in {input}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_mutation_batches_spawn_no_processes() {
         let runner = Runner {
             output: String::new(),
             calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         };
         assert!(
             create_prs(&runner, Path::new("."), "R_repo", &[])
@@ -331,6 +433,7 @@ mod tests {
         let runner = Runner {
             output: serde_json::json!({"data": {}}).to_string(),
             calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         };
         let error = edit_prs(
             &runner,
@@ -354,6 +457,7 @@ mod tests {
             })
             .to_string(),
             calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
         };
         let error = edit_prs(
             &runner,

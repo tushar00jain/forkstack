@@ -72,6 +72,22 @@ fn parse_owner_repo(url: &str) -> Option<String> {
     (!owner.is_empty() && !tail.is_empty()).then(|| format!("{owner}/{tail}"))
 }
 
+fn github_repository_in(repo: &Repository, remote: &str) -> Result<String, String> {
+    let remote_name = remote;
+    let remote = repo
+        .find_remote(remote)
+        .map_err(|error| error.message().to_owned())?;
+    let url = remote
+        .url()
+        .ok_or_else(|| format!("remote {remote_name:?} has a non-UTF-8 URL"))?;
+    parse_owner_repo(url)
+        .ok_or_else(|| format!("could not read owner/name from the {remote_name:?} remote URL"))
+}
+
+pub(crate) fn github_repository(path: &Path, remote: &str) -> Result<String, String> {
+    github_repository_in(&open_repo(path)?, remote)
+}
+
 #[derive(Debug)]
 struct CommitRecord {
     rev: String,
@@ -330,18 +346,7 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
 fn plan_with(options: SubmitOptions, runner: &dyn CommandRunner) -> Result<SubmitPlan, String> {
     let _ = runner;
     let repo = open_repo(&options.repo)?;
-    let remote = repo
-        .find_remote(&options.remote)
-        .map_err(|error| error.message().to_owned())?;
-    let url = remote
-        .url()
-        .ok_or_else(|| format!("remote {:?} has a non-UTF-8 URL", options.remote))?;
-    let fork = parse_owner_repo(&url).ok_or_else(|| {
-        format!(
-            "could not read owner/name from the {:?} remote URL",
-            options.remote
-        )
-    })?;
+    let fork = github_repository_in(&repo, &options.remote)?;
     let base_ref = format!("{}/{}", options.remote, options.base);
     let base = repo
         .revparse_single(&format!("refs/remotes/{}/{}", options.remote, options.base))
@@ -650,7 +655,7 @@ pub fn stack_table(entries: &[(String, Option<u64>, String)], current: &str) -> 
 pub fn execute_checked(expected: &SubmitPlan) -> Result<(), String> {
     let fresh = prepare(expected.options.clone(), Some(expected))?;
     if &fresh != expected {
-        return Err("publish plan changed after fetch; press f to preview the fresh plan".into());
+        return Err("publish plan changed after fetch; press p to preview the fresh plan".into());
     }
     execute_silent(fresh)
 }

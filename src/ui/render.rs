@@ -1,6 +1,18 @@
+use std::collections::BTreeMap;
+
+use ratatui::text::Line;
 use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 
+use crate::integrations::github::PullRequestLink;
 use crate::ui::model::{Commit, Graph};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RenderedLink {
+    pub start: usize,
+    pub width: usize,
+    pub text: String,
+    pub url: String,
+}
 
 #[derive(Clone, Debug)]
 pub struct RenderedLine {
@@ -8,6 +20,7 @@ pub struct RenderedLine {
     pub commit: Option<String>,
     pub preview: bool,
     pub conflict: bool,
+    pub links: Vec<RenderedLink>,
 }
 
 fn short_id(id: &str) -> &str {
@@ -77,10 +90,39 @@ pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
                 commit: (index == 0).then(|| id.clone()),
                 preview: commit.preview,
                 conflict: commit.conflict.is_some(),
+                links: Vec::new(),
             });
         }
     }
     lines
+}
+
+pub fn attach_pr_links(
+    lines: &mut [RenderedLine],
+    graph: &Graph,
+    links: &BTreeMap<String, PullRequestLink>,
+) {
+    for line in lines {
+        line.links.clear();
+        let Some(commit) = line.commit.as_ref().and_then(|id| graph.commits.get(id)) else {
+            continue;
+        };
+        for name in &commit.remote_refs {
+            let Some(pr) = links.get(name) else {
+                continue;
+            };
+            let Some(byte_start) = line.text.find(name) else {
+                continue;
+            };
+            line.links.push(RenderedLink {
+                start: Line::raw(&line.text[..byte_start]).width(),
+                width: Line::raw(name).width(),
+                text: name.clone(),
+                url: pr.url.clone(),
+            });
+        }
+        line.links.sort_by_key(|link| link.start);
+    }
 }
 
 #[cfg(test)]
@@ -121,5 +163,43 @@ mod tests {
         assert!(rendered[0].preview);
         assert!(rendered[0].text.contains('◆'));
         assert!(!rendered[0].text.contains("[preview]"));
+    }
+
+    #[test]
+    fn existing_remote_ref_text_gets_a_link_without_extra_label_text() {
+        let commit = Commit {
+            id: "abcdef012345".into(),
+            subject: "subject".into(),
+            remote_refs: vec![
+                "origin/fs-base/topic/1".into(),
+                "origin/fs-head/topic/1".into(),
+            ],
+            ..Commit::default()
+        };
+        let graph = Graph {
+            commits: [(commit.id.clone(), commit.clone())].into(),
+            order: vec![commit.id.clone()],
+            ..Graph::default()
+        };
+        let original = commit_label(&commit, None);
+        let mut rendered = render_graph(&graph);
+        attach_pr_links(
+            &mut rendered,
+            &graph,
+            &[(
+                ("origin/fs-head/topic/1").into(),
+                PullRequestLink {
+                    number: 9,
+                    head_ref_name: "fs-head/topic/1".into(),
+                    url: "https://example.invalid/9".into(),
+                },
+            )]
+            .into(),
+        );
+
+        assert!(rendered[0].text.ends_with(&original));
+        assert_eq!(rendered[0].links.len(), 1);
+        assert_eq!(rendered[0].links[0].text, "origin/fs-head/topic/1");
+        assert_eq!(rendered[0].links[0].url, "https://example.invalid/9");
     }
 }
