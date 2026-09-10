@@ -40,7 +40,13 @@ pub fn commit_label(commit: &Commit, head_branch: Option<&str>) -> String {
         format!(" ({})", labels.join(", "))
     };
     let preview = if commit.preview { " [preview]" } else { "" };
-    format!("{}{}{} {}", short_id(&commit.id), decoration, preview, commit.subject)
+    format!(
+        "{}{}{} {}",
+        short_id(&commit.id),
+        decoration,
+        preview,
+        commit.subject
+    )
 }
 
 pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
@@ -50,8 +56,15 @@ pub fn render_graph(graph: &Graph) -> Vec<RenderedLine> {
         .build_box_drawing();
     let mut lines = Vec::new();
     for id in &graph.order {
-        let Some(commit) = graph.commits.get(id) else { continue };
-        let parents = commit.parents.iter().cloned().map(Ancestor::Parent).collect();
+        let Some(commit) = graph.commits.get(id) else {
+            continue;
+        };
+        let parents = commit
+            .parents
+            .iter()
+            .cloned()
+            .map(Ancestor::Parent)
+            .collect();
         let glyph = if commit.conflict.is_some() {
             "x"
         } else if commit.preview {

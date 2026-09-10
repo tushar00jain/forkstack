@@ -129,7 +129,7 @@ commits; local refs follow them and `origin/*` refs remain on real commits.
 | `Up` / `Down` | select a commit |
 | `Enter` | check out the selected commit, or preview a pending move |
 | `Space` | pick up one commit |
-| `Shift+Space` | pick up the commit and the linear substack above it |
+| `s` or `Shift+Space` | pick up the commit and the linear substack above it |
 | `a` | apply the previewed move |
 | `Esc` | cancel a move |
 | `/`, `n`, `N` | search, next match, previous match |
@@ -138,10 +138,14 @@ commits; local refs follow them and `origin/*` refs remain on real commits.
 
 Rewrites require a clean working tree and a checked-out local branch. Single
 commits can be reordered within that branch's linear history; pick up a
-substack to move it onto another stack. Merge commits and ambiguous operations
-are refused. Rewrites use native `git rebase --update-refs`, so local branch
-decorations move with their commits while remote decorations remain where they
-were until you run Forkstack or another publishing tool externally.
+substack to insert it after a commit on another stack. The destination's
+linear descendants are replayed above the inserted substack; destinations with
+multiple descendant tips are refused as ambiguous. Merge commits and other
+ambiguous operations are refused. Rewrites use native `git rebase --update-refs`. Forkstack layer
+rewrites run from detached HEAD so every `fs-head/*` branch follows its logical
+commit, then the branch at the resulting stack tip is checked out. Remote
+decorations remain where they were until you run Forkstack or another
+publishing tool externally.
 
 If Git stops on a conflict, the incoming and local nodes are marked in red.
 Resolve it externally with the normal `git status`, `git rebase --continue`,

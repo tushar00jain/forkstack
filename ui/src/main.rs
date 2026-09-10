@@ -17,7 +17,9 @@ fn main() {
         if args.len() != 3 {
             usage();
         }
-        if let Err(error) = git::run_sequence_editor(&PathBuf::from(&args[1]), &PathBuf::from(&args[2])) {
+        if let Err(error) =
+            git::run_sequence_editor(&PathBuf::from(&args[1]), &PathBuf::from(&args[2]))
+        {
             eprintln!("{error}");
             std::process::exit(1);
         }

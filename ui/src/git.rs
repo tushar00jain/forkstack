@@ -29,18 +29,28 @@ fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
 
 fn verify(repo: &Path, revision: &str) -> Option<String> {
     let result = output(repo, &["rev-parse", "--verify", "-q", revision]).ok()?;
-    result.status.success().then(|| String::from_utf8_lossy(&result.stdout).trim().to_owned())
+    result
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&result.stdout).trim().to_owned())
 }
 
 pub fn conflict_label(markers: &[(String, String)], files: &[String]) -> Option<String> {
     if markers.is_empty() {
         return None;
     }
-    let kinds = markers.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>().join("/");
+    let kinds = markers
+        .iter()
+        .map(|(kind, _)| kind.as_str())
+        .collect::<Vec<_>>()
+        .join("/");
     if files.is_empty() {
         Some(format!("incoming, conflict ({kinds})"))
     } else {
-        Some(format!("incoming, conflict ({kinds}: {})", files.join(", ")))
+        Some(format!(
+            "incoming, conflict ({kinds}: {})",
+            files.join(", ")
+        ))
     }
 }
 
@@ -58,12 +68,15 @@ fn parse_log(log: &str) -> Result<(HashMap<String, Commit>, Vec<String>), String
         }
         let id = fields[0].to_owned();
         order.push(id.clone());
-        commits.insert(id.clone(), Commit {
-            id,
-            parents: fields[1].split_whitespace().map(str::to_owned).collect(),
-            subject: fields[2].to_owned(),
-            ..Commit::default()
-        });
+        commits.insert(
+            id.clone(),
+            Commit {
+                id,
+                parents: fields[1].split_whitespace().map(str::to_owned).collect(),
+                subject: fields[2].to_owned(),
+                ..Commit::default()
+            },
+        );
     }
     Ok((commits, order))
 }
@@ -103,7 +116,9 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
     for (_, id) in &markers {
         command.arg(id);
     }
-    let result = command.output().map_err(|error| format!("could not run git: {error}"))?;
+    let result = command
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
     if !result.status.success() {
         return Err(String::from_utf8_lossy(&result.stderr).trim().to_owned());
     }
@@ -112,11 +127,20 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
 
     let refs = run(
         repo,
-        &["for-each-ref", "--format=%(objectname)%00%(refname)", "refs/heads", "refs/remotes"],
+        &[
+            "for-each-ref",
+            "--format=%(objectname)%00%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
     )?;
     for line in refs.lines() {
-        let Some((id, name)) = line.split_once('\0') else { continue };
-        let Some(commit) = commits.get_mut(id) else { continue };
+        let Some((id, name)) = line.split_once('\0') else {
+            continue;
+        };
+        let Some(commit) = commits.get_mut(id) else {
+            continue;
+        };
         if let Some(name) = name.strip_prefix("refs/heads/") {
             commit.local_refs.push(name.into());
         } else if let Some(name) = name.strip_prefix("refs/remotes/") {
@@ -146,7 +170,12 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
         commit.remote_refs.sort();
         commit.tags.sort();
     }
-    Ok(Graph { commits, order, head, branch })
+    Ok(Graph {
+        commits,
+        order,
+        head,
+        branch,
+    })
 }
 
 fn assert_clean(repo: &Path) -> Result<(), String> {
@@ -167,7 +196,16 @@ fn assert_clean(repo: &Path) -> Result<(), String> {
 
 pub fn checkout(repo: &Path, revision: &str) -> Result<(), String> {
     assert_clean(repo)?;
-    let refs = run(repo, &["for-each-ref", "--format=%(refname:short)", "--points-at", revision, "refs/heads"])?;
+    let refs = run(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--points-at",
+            revision,
+            "refs/heads",
+        ],
+    )?;
     let branches: Vec<_> = refs.lines().filter(|line| !line.is_empty()).collect();
     if branches.len() == 1 {
         run(repo, &["switch", branches[0]])?;
@@ -187,7 +225,11 @@ pub fn reorder_todo(original: &str, order: &[String]) -> Result<String, String> 
     let mut current: Option<String> = None;
     for line in original.split_inclusive('\n') {
         if line.starts_with("pick ") {
-            let id = line.split_whitespace().nth(1).ok_or("invalid rebase todo")?.to_owned();
+            let id = line
+                .split_whitespace()
+                .nth(1)
+                .ok_or("invalid rebase todo")?
+                .to_owned();
             blocks.insert(id.clone(), vec![line.into()]);
             current = Some(id);
         } else if !line.starts_with('#') {
@@ -203,7 +245,11 @@ pub fn reorder_todo(original: &str, order: &[String]) -> Result<String, String> 
     }
     let mut arranged = String::new();
     for wanted in order {
-        let matches: Vec<_> = blocks.keys().filter(|id| wanted.starts_with(id.as_str())).cloned().collect();
+        let matches: Vec<_> = blocks
+            .keys()
+            .filter(|id| wanted.starts_with(id.as_str()))
+            .cloned()
+            .collect();
         if matches.len() != 1 {
             return Err(format!("could not identify {wanted} in rebase todo"));
         }
@@ -226,17 +272,72 @@ pub fn run_sequence_editor(order_path: &Path, todo_path: &Path) -> Result<(), St
 
 pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
     assert_clean(repo)?;
+    if plan.include_descendants {
+        let carried_tip = plan
+            .commits
+            .get(plan.carried_count.saturating_sub(1))
+            .ok_or("substack move has no carried commits")?;
+        run(repo, &["switch", "--detach", carried_tip])?;
+    } else if plan.detach_for_rewrite {
+        run(repo, &["switch", "--detach", &plan.tip_commit])?;
+    }
     let result = if plan.include_descendants {
-        output(repo, &["rebase", "--update-refs", "--onto", &plan.destination, &plan.base, &plan.tip])?
+        let first = output(
+            repo,
+            &[
+                "rebase",
+                "--update-refs",
+                "--onto",
+                &plan.destination,
+                &plan.source_base,
+            ],
+        )?;
+        if !first.status.success() {
+            first
+        } else if plan.commits.len() == plan.carried_count {
+            first
+        } else {
+            let carried_tip = run(repo, &["rev-parse", "HEAD"])?;
+            run(repo, &["switch", "--detach", &plan.tip_commit])?;
+            output(
+                repo,
+                &[
+                    "rebase",
+                    "--update-refs",
+                    "--onto",
+                    &carried_tip,
+                    &plan.destination,
+                ],
+            )?
+        }
     } else {
-        let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-        let order_path = env::temp_dir().join(format!("forkstack-ui-{}-{stamp}.todo", std::process::id()));
-        fs::write(&order_path, format!("{}\n", plan.commits.join("\n"))).map_err(|error| error.to_string())?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let order_path =
+            env::temp_dir().join(format!("forkstack-ui-{}-{stamp}.todo", std::process::id()));
+        fs::write(&order_path, format!("{}\n", plan.commits.join("\n")))
+            .map_err(|error| error.to_string())?;
         let executable = env::current_exe().map_err(|error| error.to_string())?;
-        let editor = format!("{} --sequence-editor {}", shell_quote(&executable.to_string_lossy()), shell_quote(&order_path.to_string_lossy()));
-        let result = Command::new("git")
-            .current_dir(repo)
-            .args(["-c", "rebase.abbreviateCommands=false", "rebase", "--interactive", "--update-refs", &plan.base, &plan.tip])
+        let editor = format!(
+            "{} --sequence-editor {}",
+            shell_quote(&executable.to_string_lossy()),
+            shell_quote(&order_path.to_string_lossy())
+        );
+        let mut command = Command::new("git");
+        command.current_dir(repo).args([
+            "-c",
+            "rebase.abbreviateCommands=false",
+            "rebase",
+            "--interactive",
+            "--update-refs",
+            &plan.base,
+        ]);
+        if !plan.detach_for_rewrite {
+            command.arg(&plan.tip);
+        }
+        let result = command
             .env("GIT_SEQUENCE_EDITOR", editor)
             .output()
             .map_err(|error| format!("could not run git: {error}"))?;
@@ -244,6 +345,9 @@ pub fn apply_move(repo: &Path, plan: &MovePlan) -> Result<(), String> {
         result
     };
     if result.status.success() {
+        if plan.detach_for_rewrite || plan.include_descendants {
+            run(repo, &["switch", &plan.checkout_branch])?;
+        }
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&result.stderr).trim().to_owned();
@@ -275,7 +379,13 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
             Request::Stop => break,
         };
         let graph = load_graph(&repo);
-        if responses.send(Response { graph, operation_error: operation }).is_err() {
+        if responses
+            .send(Response {
+                graph,
+                operation_error: operation,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -284,6 +394,25 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        run(repo, args).unwrap()
+    }
+
+    fn commit_on_new_branch(repo: &Path, branch: &str, start: Option<&str>, subject: &str) {
+        let mut args = vec!["switch", "-c", branch];
+        if let Some(start) = start {
+            args.push(start);
+        }
+        git(repo, &args);
+        fs::write(
+            repo.join(format!("{}.txt", subject.to_lowercase())),
+            subject,
+        )
+        .unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", subject]);
+    }
 
     #[test]
     fn parses_and_reorders_rebase_blocks() {
@@ -298,14 +427,84 @@ mod tests {
         let input = "bbbb\x1faaaa cccc\x1fmerge subject\x1e\naaaa\x1f\x1froot\x1e\n";
         let (commits, order) = parse_log(input).unwrap();
         assert_eq!(order, vec!["bbbb".to_owned(), "aaaa".to_owned()]);
-        assert_eq!(commits["bbbb"].parents, vec!["aaaa".to_owned(), "cccc".to_owned()]);
+        assert_eq!(
+            commits["bbbb"].parents,
+            vec!["aaaa".to_owned(), "cccc".to_owned()]
+        );
         assert_eq!(commits["aaaa"].subject, "root");
     }
 
     #[test]
     fn conflict_detection_labels_kind_and_files() {
         let markers = vec![("rebase".into(), "abc".into())];
-        assert_eq!(conflict_label(&markers, &["src/lib.rs".into()]).unwrap(), "incoming, conflict (rebase: src/lib.rs)");
+        assert_eq!(
+            conflict_label(&markers, &["src/lib.rs".into()]).unwrap(),
+            "incoming, conflict (rebase: src/lib.rs)"
+        );
         assert_eq!(conflict_label(&[], &[]), None);
+    }
+
+    #[test]
+    fn applies_substack_as_an_insertion_before_destination_descendants() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo = env::temp_dir().join(format!(
+            "forkstack-insertion-test-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.name", "Forkstack Test"]);
+        git(&repo, &["config", "user.email", "forkstack@example.com"]);
+        fs::write(repo.join("root.txt"), "root").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "Root"]);
+        let root = git(&repo, &["rev-parse", "HEAD"]);
+
+        commit_on_new_branch(&repo, "fs-head/alpha/2", Some(&root), "Alpha2");
+        commit_on_new_branch(&repo, "fs-head/alpha/3", None, "Alpha3");
+        commit_on_new_branch(&repo, "fs-head/gamma/1", None, "Gamma1");
+        commit_on_new_branch(&repo, "fs-head/gamma/2", None, "Gamma2");
+        commit_on_new_branch(&repo, "fs-head/gamma/3", None, "Gamma3");
+        commit_on_new_branch(&repo, "fs-head/beta/2", Some(&root), "Beta2");
+        commit_on_new_branch(&repo, "fs-head/beta/3", None, "Beta3");
+
+        let graph = load_graph(&repo).unwrap();
+        let beta3 = git(&repo, &["rev-parse", "fs-head/beta/3"]);
+        let alpha2 = git(&repo, &["rev-parse", "fs-head/alpha/2"]);
+        let plan = graph.plan_move(&beta3, &alpha2, true).unwrap();
+        apply_move(&repo, &plan).unwrap();
+
+        assert_eq!(
+            git(
+                &repo,
+                &[
+                    "log",
+                    "--first-parent",
+                    "--format=%s",
+                    "-6",
+                    "fs-head/gamma/3",
+                ],
+            )
+            .lines()
+            .collect::<Vec<_>>(),
+            ["Gamma3", "Gamma2", "Gamma1", "Alpha3", "Beta3", "Alpha2"]
+        );
+        for (branch, subject) in [
+            ("fs-head/beta/3", "Beta3"),
+            ("fs-head/alpha/3", "Alpha3"),
+            ("fs-head/gamma/1", "Gamma1"),
+            ("fs-head/gamma/2", "Gamma2"),
+            ("fs-head/gamma/3", "Gamma3"),
+        ] {
+            assert_eq!(git(&repo, &["show", "-s", "--format=%s", branch]), subject);
+        }
+        assert_eq!(
+            git(&repo, &["symbolic-ref", "--short", "HEAD"]),
+            "fs-head/gamma/3"
+        );
+        fs::remove_dir_all(repo).unwrap();
     }
 }
