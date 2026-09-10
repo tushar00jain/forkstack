@@ -1,0 +1,23 @@
+[package]
+name = "forkstack-ui"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A native Git stack graph and history editor"
+
+[dependencies]
+crossterm = { version = "0.28", default-features = false, features = ["events"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+sapling-renderdag = "0.1.0"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.release]
+debug = 0
+strip = true
+codegen-units = 16
+lto = false
+panic = "abort"
+

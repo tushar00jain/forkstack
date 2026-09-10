@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "forkstack"
+version = "0.1.0"
+description = "Stacked pull requests inside your own GitHub fork"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+forkstack = "forkstack.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["forkstack"]
