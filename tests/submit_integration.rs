@@ -429,7 +429,7 @@ fn branch_assignment_reads_real_commit_history() {
 }
 
 #[test]
-fn tagged_stack_planning_uses_two_git_processes() {
+fn tagged_stack_planning_uses_no_git_processes() {
     let fixture = fixture();
     let options = options(&fixture.repo);
     let mut initial = plan(options.clone()).unwrap();
@@ -439,9 +439,7 @@ fn tagged_stack_planning_uses_two_git_processes() {
     let plan = test_support::plan_with_runner(options, &runner).unwrap();
     assert!(plan.commits.iter().all(|step| !step.identity_added));
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls.len(), 2, "unexpected Git commands: {calls:?}");
-    assert_eq!(calls[0][..2], ["remote", "get-url"]);
-    assert_eq!(calls[1][0], "log");
+    assert!(calls.is_empty(), "unexpected Git commands: {calls:?}");
 }
 
 #[test]
@@ -462,10 +460,59 @@ fn planning_process_count_is_independent_of_small_stack_size() {
     let plan = test_support::plan_with_runner(options(&fixture.repo), &runner).unwrap();
     assert_eq!(plan.commits.len(), 12);
     let calls = runner.calls.lock().unwrap();
-    assert_eq!(calls.len(), 3, "unexpected Git commands: {calls:?}");
-    assert_eq!(calls[0][..2], ["remote", "get-url"]);
-    assert_eq!(calls[1][0], "log");
-    assert_eq!(calls[2][0], "for-each-ref");
+    assert!(calls.is_empty(), "unexpected Git commands: {calls:?}");
+}
+
+#[test]
+fn graph_does_not_walk_unrelated_branch_history() {
+    let fixture = fixture();
+    git(&fixture.repo, &["switch", "--orphan", "unrelated"]);
+    git(
+        &fixture.repo,
+        &["commit", "--allow-empty", "-m", "unrelated root"],
+    );
+    let unrelated = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "main"]);
+
+    let graph = forkstack::ui::git::load_graph_for(&fixture.repo, "origin", "main").unwrap();
+    assert!(!graph.commits.contains_key(&unrelated));
+    assert!(graph.commits.contains_key(&fixture.second));
+    assert!(graph.commits.contains_key(&fixture.base));
+}
+
+#[test]
+fn graph_reads_conflicted_paths_from_the_index() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &["switch", "-c", "conflict-side", &fixture.base],
+    );
+    fs::write(fixture.repo.join("shared"), "side\n").unwrap();
+    git(&fixture.repo, &["add", "shared"]);
+    git(&fixture.repo, &["commit", "-m", "side conflict"]);
+    let incoming = git(&fixture.repo, &["rev-parse", "HEAD"]);
+
+    git(&fixture.repo, &["switch", "main"]);
+    fs::write(fixture.repo.join("shared"), "local\n").unwrap();
+    git(&fixture.repo, &["add", "shared"]);
+    git(&fixture.repo, &["commit", "-m", "local conflict"]);
+    let local = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let merge = Command::new("git")
+        .args(["merge", "conflict-side"])
+        .current_dir(&fixture.repo)
+        .output()
+        .unwrap();
+    assert!(!merge.status.success());
+
+    let graph = forkstack::ui::git::load_graph_for(&fixture.repo, "origin", "main").unwrap();
+    assert_eq!(
+        graph.commits[&local].conflict.as_deref(),
+        Some("local (conflict in progress)")
+    );
+    assert_eq!(
+        graph.commits[&incoming].conflict.as_deref(),
+        Some("incoming, conflict (merge: shared)")
+    );
 }
 
 #[test]
@@ -626,6 +673,41 @@ fn divergent_local_head_is_not_overwritten() {
 }
 
 #[test]
+fn head_checked_out_in_another_worktree_is_not_overwritten() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/fs-head/draft/1", fixture.base),
+        ],
+    );
+    fetch_all(&fixture.repo);
+    git(&fixture.repo, &["branch", "fs-head/draft/1", &fixture.base]);
+    let worktree = fixture.root.join("linked-worktree");
+    git(
+        &fixture.repo,
+        &[
+            "worktree",
+            "add",
+            worktree.to_str().unwrap(),
+            "fs-head/draft/1",
+        ],
+    );
+
+    let mut submit = plan(options(&fixture.repo)).unwrap();
+    submit.commits.truncate(1);
+    submit.commits[0].identity_added = false;
+    let error = test_support::sync_local_heads(&submit).unwrap_err();
+    assert!(error.contains("checked out in a worktree"), "{error}");
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]),
+        fixture.base
+    );
+}
+
+#[test]
 fn execute_creates_and_then_restacks_pull_requests() {
     let fixture = fixture();
     let runner = FakeRunner::default();
@@ -650,15 +732,58 @@ fn execute_creates_and_then_restacks_pull_requests() {
         .unwrap(),
         Some("draft/1".into())
     );
+    assert_eq!(
+        identity_from_message(&git(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", &seeded[1]]
+        ))
+        .unwrap(),
+        Some("draft/2".into())
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]),
+        seeded[0]
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/2"]),
+        seeded[1]
+    );
+    assert_eq!(
+        git(&fixture.repo, &["config", "branch.fs-head/draft/1.remote"]),
+        "origin"
+    );
+    assert_eq!(
+        git(&fixture.repo, &["config", "branch.fs-head/draft/1.merge"]),
+        "refs/heads/fs-head/draft/1"
+    );
     {
         let state = runner.state.lock().unwrap();
         assert_eq!(state.prs.len(), 2);
-        assert_eq!(state.prs["fs-head/draft/1"].base, "fs-base/draft/1");
-        assert_eq!(state.prs["fs-head/draft/2"].base, "fs-base/draft/2");
-        assert!(state.prs.values().all(|pr| pr.draft));
+        let first = &state.prs["fs-head/draft/1"];
+        let second = &state.prs["fs-head/draft/2"];
+        assert_eq!(first.base, "fs-base/draft/1");
+        assert_eq!(second.base, "fs-base/draft/2");
+        assert_eq!(first.title, "first change");
+        assert_eq!(second.title, "second change");
+        assert!(first.body.contains("Stack (top to bottom):"));
+        assert!(first.body.contains("- -> #101 first change"));
+        assert!(second.body.contains("- -> #102 second change"));
+        assert!(first.draft && second.draft);
         assert_eq!(state.pushes.len(), 1);
         assert!(state.pushes[0].contains(&"--atomic".into()));
         assert!(state.pushes[0].contains(&"--force-with-lease".into()));
+        assert_eq!(
+            state.events,
+            [
+                "gh:list",
+                "gh:list",
+                "git:push",
+                "gh:create",
+                "gh:create",
+                "gh:edit",
+                "gh:edit"
+            ]
+        );
     }
 
     git(&fixture.repo, &["switch", "--detach", &fixture.base]);
@@ -670,17 +795,81 @@ fn execute_creates_and_then_restacks_pull_requests() {
     let mut second_plan = plan(options).unwrap();
     execute_with(&mut second_plan, &runner, &mut |_| {}).unwrap();
     fetch_all(&fixture.repo);
+    let first_head = git(&fixture.repo, &["rev-parse", "origin/fs-head/draft/1"]);
+    let second_head = git(&fixture.repo, &["rev-parse", "origin/fs-head/draft/2"]);
+    let first_base = git(&fixture.repo, &["rev-parse", "origin/fs-base/draft/1"]);
+    let second_base = git(&fixture.repo, &["rev-parse", "origin/fs-base/draft/2"]);
+    assert_eq!(first_head, reordered_first);
+    assert_eq!(second_head, reordered_second);
+    assert_eq!(first_base, reordered_second);
+    assert_eq!(second_base, fixture.base);
     assert_eq!(
-        git(&fixture.repo, &["rev-parse", "origin/fs-head/draft/1"]),
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]),
         reordered_first
     );
     assert_eq!(
-        git(&fixture.repo, &["rev-parse", "origin/fs-head/draft/2"]),
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/2"]),
         reordered_second
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "origin/draft/1"]),
+        fixture.first
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "origin/draft/2"]),
+        fixture.second
+    );
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["diff", "--binary", &first_base, &first_head]
+        ),
+        git(
+            &fixture.repo,
+            &["diff", "--binary", &reordered_second, &reordered_first]
+        )
+    );
+    assert_eq!(
+        git(
+            &fixture.repo,
+            &["diff", "--binary", &second_base, &second_head]
+        ),
+        git(
+            &fixture.repo,
+            &["diff", "--binary", &fixture.base, &reordered_second]
+        )
     );
     let state = runner.state.lock().unwrap();
     assert_eq!(state.prs.len(), 2);
+    assert_eq!(state.prs["fs-head/draft/1"].base, "fs-base/draft/1");
+    assert_eq!(state.prs["fs-head/draft/2"].base, "fs-base/draft/2");
+    assert_eq!(state.prs["fs-head/draft/1"].title, "first change");
+    assert_eq!(state.prs["fs-head/draft/2"].title, "second change");
+    assert!(
+        state.prs["fs-head/draft/1"]
+            .body
+            .contains("- -> #101 first change")
+    );
+    assert!(
+        state.prs["fs-head/draft/2"]
+            .body
+            .contains("- -> #102 second change")
+    );
     assert_eq!(state.pushes.len(), 2);
+    for branch in [
+        "fs-base/draft/1",
+        "fs-base/draft/2",
+        "fs-head/draft/1",
+        "fs-head/draft/2",
+    ] {
+        assert!(
+            state.pushes[1]
+                .iter()
+                .any(|arg| arg.contains(&format!("refs/heads/{branch}")))
+        );
+    }
+    assert!(state.pushes[1].contains(&"--atomic".into()));
+    assert!(state.pushes[1].contains(&"--force-with-lease".into()));
     assert_eq!(
         &state.events[7..],
         ["gh:list", "gh:list", "git:push", "gh:edit", "gh:edit"]

@@ -8,6 +8,7 @@ description = "Stacked pull-request submission and interactive Git graph tooling
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.28", default-features = false, features = ["events"] }
+git2 = { version = "0.20", default-features = false }
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 sapling-renderdag = "0.1.0"
 serde = { version = "1", features = ["derive"] }

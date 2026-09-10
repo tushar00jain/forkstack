@@ -72,10 +72,10 @@ pub struct App {
 
 impl App {
     pub fn new(publish_options: SubmitOptions) -> Self {
-        let repo = publish_options.repo.clone();
+        let worker_options = publish_options.clone();
         let (request_tx, request_rx) = mpsc::channel();
         let (response_tx, response_rx) = mpsc::channel();
-        thread::spawn(move || worker(repo, request_rx, response_tx));
+        thread::spawn(move || worker(worker_options, request_rx, response_tx));
         let app = Self {
             graph: None,
             preview: None,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,7 +6,8 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::integrations::{self, CommandRunner, ProcessRunner};
+use git2::{Oid, Repository, Sort};
+
 use crate::ui::model::{Commit, Graph, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
@@ -55,58 +56,76 @@ pub fn conflict_label(markers: &[(String, String)], files: &[String]) -> Option<
     }
 }
 
-fn parse_log(log: &str) -> Result<(HashMap<String, Commit>, Vec<String>), String> {
-    let mut commits = HashMap::new();
-    let mut order = Vec::new();
-    for record in log.split('\x1e') {
-        let record = record.trim_matches(|character| character == '\n' || character == '\r');
-        if record.is_empty() {
-            continue;
-        }
-        let fields: Vec<_> = record.splitn(3, '\x1f').collect();
-        if fields.len() != 3 {
-            return Err("git log returned an unexpected record".into());
-        }
-        let id = fields[0].to_owned();
-        order.push(id.clone());
-        commits.insert(
-            id.clone(),
-            Commit {
-                id,
-                parents: fields[1].split_whitespace().map(str::to_owned).collect(),
-                subject: fields[2].to_owned(),
-                ..Commit::default()
-            },
-        );
-    }
-    Ok((commits, order))
-}
-
 pub fn load_graph(repo: &Path) -> Result<Graph, String> {
-    load_graph_with(repo, &ProcessRunner, &|path| fs::read_to_string(path).ok())
+    load_graph_for(repo, "origin", "main")
 }
 
-fn load_graph_with(
-    repo: &Path,
-    runner: &dyn CommandRunner,
-    read_marker: &dyn Fn(&Path) -> Option<String>,
-) -> Result<Graph, String> {
-    let metadata = integrations::git::run(
-        runner,
-        repo,
-        &[
-            "rev-parse",
-            "--absolute-git-dir",
-            "HEAD",
-            "--symbolic-full-name",
-            "HEAD",
-        ],
-    )?;
-    let mut metadata = metadata.lines();
-    let git_dir = PathBuf::from(metadata.next().ok_or("git did not report its directory")?);
-    let head = metadata.next().ok_or("git did not report HEAD")?.to_owned();
-    let branch = metadata
-        .next()
+fn add_matching_refs(
+    repository: &Repository,
+    glob: &str,
+    roots: &mut BTreeSet<Oid>,
+    refs: &mut Vec<(Oid, String)>,
+) -> Result<(), String> {
+    let iter = repository
+        .references_glob(glob)
+        .map_err(|error| error.message().to_owned())?;
+    for reference in iter {
+        let reference = reference.map_err(|error| error.message().to_owned())?;
+        let Some(name) = reference.name() else {
+            continue;
+        };
+        let Ok(commit) = reference.peel_to_commit() else {
+            continue;
+        };
+        roots.insert(commit.id());
+        refs.push((commit.id(), name.to_owned()));
+    }
+    Ok(())
+}
+
+fn bounded_ref_globs(remote: &str, base: &str) -> [String; 6] {
+    [
+        "refs/heads/fs-head/*".into(),
+        "refs/heads/fs-base/*".into(),
+        format!("refs/heads/{base}"),
+        format!("refs/remotes/{remote}/fs-head/*"),
+        format!("refs/remotes/{remote}/fs-base/*"),
+        format!("refs/remotes/{remote}/{base}"),
+    ]
+}
+
+fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
+    let index = repository
+        .index()
+        .map_err(|error| error.message().to_owned())?;
+    let conflicts = index
+        .conflicts()
+        .map_err(|error| error.message().to_owned())?;
+    let mut paths = BTreeSet::new();
+    for conflict in conflicts {
+        let conflict = conflict.map_err(|error| error.message().to_owned())?;
+        for entry in [conflict.ancestor, conflict.our, conflict.their]
+            .into_iter()
+            .flatten()
+        {
+            paths.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, String> {
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    let head_ref = repository
+        .head()
+        .map_err(|error| error.message().to_owned())?;
+    let head_commit = head_ref
+        .peel_to_commit()
+        .map_err(|error| error.message().to_owned())?;
+    let head_oid = head_commit.id();
+    let head = head_oid.to_string();
+    let branch = head_ref
+        .name()
         .and_then(|name| name.strip_prefix("refs/heads/"))
         .map(str::to_owned);
 
@@ -118,46 +137,63 @@ fn load_graph_with(
     let markers: Vec<(String, String)> = marker_names
         .iter()
         .filter_map(|(kind, name)| {
-            read_marker(&git_dir.join(name))
+            fs::read_to_string(repository.path().join(name))
+                .ok()
                 .and_then(|contents| contents.split_whitespace().next().map(str::to_owned))
                 .map(|id| ((*kind).into(), id))
         })
         .collect();
-    let files = integrations::git::run(runner, repo, &["diff", "--name-only", "--diff-filter=U"])
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+    let files = conflict_paths(&repository).unwrap_or_default();
 
-    let mut args = vec![
-        "log".into(),
-        "--branches".into(),
-        "--remotes".into(),
-        "HEAD".into(),
-        "--topo-order".into(),
-        "--format=%H%x1f%P%x1f%s%x1e".into(),
-    ];
-    for (_, id) in &markers {
-        args.push(id.clone());
+    let mut roots = BTreeSet::from([head_oid]);
+    let mut refs = Vec::new();
+    if let Some(name) = head_ref.name() {
+        refs.push((head_oid, name.to_owned()));
     }
-    let log = integrations::git::run_owned(runner, repo, &args)?;
-    let (mut commits, order) = parse_log(&log)?;
+    for glob in bounded_ref_globs(remote, base) {
+        add_matching_refs(&repository, &glob, &mut roots, &mut refs)?;
+    }
+    for (_, id) in &markers {
+        if let Ok(oid) = Oid::from_str(id) {
+            roots.insert(oid);
+        }
+    }
 
-    let refs = integrations::git::run(
-        runner,
-        repo,
-        &[
-            "for-each-ref",
-            "--format=%(objectname)%00%(refname)",
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )?;
-    for line in refs.lines() {
-        let Some((id, name)) = line.split_once('\0') else {
-            continue;
-        };
-        let Some(commit) = commits.get_mut(id) else {
+    let mut walk = repository
+        .revwalk()
+        .map_err(|error| error.message().to_owned())?;
+    walk.set_sorting(Sort::TOPOLOGICAL)
+        .map_err(|error| error.message().to_owned())?;
+    for root in &roots {
+        walk.push(*root)
+            .map_err(|error| error.message().to_owned())?;
+    }
+    let mut commits = HashMap::new();
+    let mut order = Vec::new();
+    for oid in walk {
+        let oid = oid.map_err(|error| error.message().to_owned())?;
+        let git_commit = repository
+            .find_commit(oid)
+            .map_err(|error| error.message().to_owned())?;
+        let id = oid.to_string();
+        order.push(id.clone());
+        commits.insert(
+            id.clone(),
+            Commit {
+                id,
+                parents: git_commit
+                    .parent_ids()
+                    .map(|parent| parent.to_string())
+                    .collect(),
+                subject: git_commit.summary().unwrap_or_default().to_owned(),
+                ..Commit::default()
+            },
+        );
+    }
+
+    for (oid, name) in refs {
+        let id = oid.to_string();
+        let Some(commit) = commits.get_mut(&id) else {
             continue;
         };
         if let Some(name) = name.strip_prefix("refs/heads/") {
@@ -170,6 +206,19 @@ fn load_graph_with(
             }
         } else if let Some(name) = name.strip_prefix("refs/tags/") {
             commit.tags.push(name.into());
+        }
+    }
+    // Tags decorate visible commits but are deliberately not graph roots.
+    if let Ok(tags) = repository.references_glob("refs/tags/*") {
+        for reference in tags.flatten() {
+            let (Some(name), Ok(commit)) = (reference.name(), reference.peel_to_commit()) else {
+                continue;
+            };
+            if let Some(visible) = commits.get_mut(&commit.id().to_string()) {
+                visible
+                    .tags
+                    .push(name.trim_start_matches("refs/tags/").to_owned());
+            }
         }
     }
     if let Some(commit) = commits.get_mut(&head) {
@@ -186,8 +235,11 @@ fn load_graph_with(
     }
     for commit in commits.values_mut() {
         commit.local_refs.sort();
+        commit.local_refs.dedup();
         commit.remote_refs.sort();
+        commit.remote_refs.dedup();
         commit.tags.sort();
+        commit.tags.dedup();
     }
     Ok(Graph {
         commits,
@@ -418,7 +470,12 @@ pub struct Response {
     pub operation_error: Option<String>,
 }
 
-pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Response>) {
+pub fn worker(
+    options: crate::core::submit::SubmitOptions,
+    requests: Receiver<Request>,
+    responses: Sender<Response>,
+) {
+    let repo = options.repo.clone();
     while let Ok(request) = requests.recv() {
         let mut preview = None;
         let mut publish_plan = None;
@@ -427,31 +484,36 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
             Request::Load => None,
             Request::Checkout(id) => checkout(&repo, &id).err(),
             Request::Apply(plan) => apply_move(&repo, &plan).err(),
-            Request::PublishPreview(options) => match crate::core::submit::plan(options) {
-                Ok(plan) => match load_graph(&repo) {
-                    Ok(graph) => match graph.publish_preview(&plan) {
-                        Ok(publish_preview) => {
-                            loaded_graph = Some(Ok(graph));
-                            preview = Some(publish_preview);
-                            publish_plan = Some(plan);
-                            None
-                        }
+            Request::PublishPreview(publish_options) => {
+                let remote = publish_options.remote.clone();
+                let base = publish_options.base.clone();
+                match crate::core::submit::plan(publish_options) {
+                    Ok(plan) => match load_graph_for(&repo, &remote, &base) {
+                        Ok(graph) => match graph.publish_preview(&plan) {
+                            Ok(publish_preview) => {
+                                loaded_graph = Some(Ok(graph));
+                                preview = Some(publish_preview);
+                                publish_plan = Some(plan);
+                                None
+                            }
+                            Err(error) => {
+                                loaded_graph = Some(Ok(graph));
+                                Some(error)
+                            }
+                        },
                         Err(error) => {
-                            loaded_graph = Some(Ok(graph));
+                            loaded_graph = Some(Err(error.clone()));
                             Some(error)
                         }
                     },
-                    Err(error) => {
-                        loaded_graph = Some(Err(error.clone()));
-                        Some(error)
-                    }
-                },
-                Err(error) => Some(error),
-            },
+                    Err(error) => Some(error),
+                }
+            }
             Request::PublishExecute(plan) => crate::core::submit::execute_checked(&plan).err(),
             Request::Stop => break,
         };
-        let graph = loaded_graph.unwrap_or_else(|| load_graph(&repo));
+        let graph =
+            loaded_graph.unwrap_or_else(|| load_graph_for(&repo, &options.remote, &options.base));
         if responses
             .send(Response {
                 graph,
@@ -469,34 +531,6 @@ pub fn worker(repo: PathBuf, requests: Receiver<Request>, responses: Sender<Resp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use std::sync::Mutex;
-
-    #[derive(Default)]
-    struct GraphRunner {
-        calls: Mutex<Vec<Vec<String>>>,
-    }
-
-    impl CommandRunner for GraphRunner {
-        fn run(
-            &self,
-            program: &str,
-            args: &[String],
-            _repo: &Path,
-            _input: Option<&str>,
-            _env: &BTreeMap<String, String>,
-        ) -> Result<String, String> {
-            assert_eq!(program, "git");
-            self.calls.lock().unwrap().push(args.to_vec());
-            match args.first().map(String::as_str) {
-                Some("rev-parse") => Ok("unused-git-dir\nabc\nrefs/heads/main".into()),
-                Some("diff") => Ok(String::new()),
-                Some("log") => Ok("abc\x1f\x1fsubject\x1e".into()),
-                Some("for-each-ref") => Ok("abc\0refs/heads/main".into()),
-                other => panic!("unexpected Git command: {other:?} {args:?}"),
-            }
-        }
-    }
 
     #[test]
     fn parses_and_reorders_rebase_blocks() {
@@ -507,30 +541,18 @@ mod tests {
     }
 
     #[test]
-    fn graph_load_uses_four_git_processes() {
-        let runner = GraphRunner::default();
-        let graph = load_graph_with(Path::new("."), &runner, &|_| None).unwrap();
-        assert_eq!(graph.head, "abc");
-        assert_eq!(graph.branch.as_deref(), Some("main"));
-        assert_eq!(graph.commits["abc"].local_refs, ["main"]);
-        let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.len(), 4, "unexpected Git commands: {calls:?}");
-        assert_eq!(calls[0][0], "rev-parse");
-        assert_eq!(calls[1][0], "diff");
-        assert_eq!(calls[2][0], "log");
-        assert_eq!(calls[3][0], "for-each-ref");
-    }
-
-    #[test]
-    fn parses_git_log_records_and_ordered_parents() {
-        let input = "bbbb\x1faaaa cccc\x1fmerge subject\x1e\naaaa\x1f\x1froot\x1e\n";
-        let (commits, order) = parse_log(input).unwrap();
-        assert_eq!(order, vec!["bbbb".to_owned(), "aaaa".to_owned()]);
+    fn graph_roots_are_limited_to_forkstack_and_configured_base_refs() {
         assert_eq!(
-            commits["bbbb"].parents,
-            vec!["aaaa".to_owned(), "cccc".to_owned()]
+            bounded_ref_globs("upstream", "trunk"),
+            [
+                "refs/heads/fs-head/*",
+                "refs/heads/fs-base/*",
+                "refs/heads/trunk",
+                "refs/remotes/upstream/fs-head/*",
+                "refs/remotes/upstream/fs-base/*",
+                "refs/remotes/upstream/trunk",
+            ]
         );
-        assert_eq!(commits["aaaa"].subject, "root");
     }
 
     #[test]

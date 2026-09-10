@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use git2::{Oid, Repository, Sort};
+
 use crate::integrations::{self, CommandRunner, ProcessRunner};
 
 pub const IDENTITY_TRAILER: &str = "fs-branch";
@@ -62,24 +64,12 @@ pub struct SubmitPlan {
     pub updates: Vec<RefUpdate>,
 }
 
-fn git_with(runner: &dyn CommandRunner, repo: &Path, args: &[&str]) -> Result<String, String> {
-    integrations::git::run(runner, repo, args)
-}
-
-fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    git_with(&ProcessRunner, repo, args)
-}
-
 fn parse_owner_repo(url: &str) -> Option<String> {
     let trimmed = url.trim().trim_end_matches(".git");
     let (_, tail) = trimmed.rsplit_once([':', '/'])?;
     let prefix = &trimmed[..trimmed.len() - tail.len() - 1];
     let owner = prefix.rsplit([':', '/']).next()?;
     (!owner.is_empty() && !tail.is_empty()).then(|| format!("{owner}/{tail}"))
-}
-
-fn commit_field(repo: &Path, rev: &str, format: &str) -> Result<String, String> {
-    git(repo, &["log", "-1", &format!("--format={format}"), rev])
 }
 
 #[derive(Debug)]
@@ -91,71 +81,80 @@ struct CommitRecord {
     message: String,
 }
 
-fn parse_commit_records(output: &str) -> Result<Vec<CommitRecord>, String> {
-    let mut records = Vec::new();
-    for record in output.split('\x1e') {
-        let record = record.trim_matches(['\n', '\r']);
-        if record.is_empty() {
-            continue;
-        }
-        let fields: Vec<_> = record.splitn(5, '\x1f').collect();
-        if fields.len() != 5 {
-            return Err("git log returned an unexpected commit record".into());
-        }
-        let parents: Vec<_> = fields[1].split_whitespace().collect();
-        if parents.len() != 1 {
-            return Err(format!(
-                "commit {} has {} parents; forkstack requires a linear stack",
-                &fields[0][..fields[0].len().min(12)],
-                parents.len()
-            ));
-        }
-        records.push(CommitRecord {
-            rev: fields[0].trim().to_owned(),
-            parent: parents[0].to_owned(),
-            subject: fields[2].trim().to_owned(),
-            body: fields[3].trim().to_owned(),
-            message: fields[4].trim().to_owned(),
-        });
+fn open_repo(path: &Path) -> Result<Repository, String> {
+    Repository::discover(path).map_err(|error| error.message().to_owned())
+}
+
+fn commit_record(commit: &git2::Commit<'_>) -> Result<CommitRecord, String> {
+    if commit.parent_count() != 1 {
+        return Err(format!(
+            "commit {} has {} parents; forkstack requires a linear stack",
+            &commit.id().to_string()[..12],
+            commit.parent_count()
+        ));
     }
+    let message = String::from_utf8_lossy(commit.message_bytes())
+        .trim()
+        .to_owned();
+    let subject = commit.summary().unwrap_or_default().trim().to_owned();
+    let body = commit.body().unwrap_or_default().trim().to_owned();
+    Ok(CommitRecord {
+        rev: commit.id().to_string(),
+        parent: commit
+            .parent_id(0)
+            .map_err(|error| error.message().to_owned())?
+            .to_string(),
+        subject,
+        body,
+        message,
+    })
+}
+
+fn validate_linear_records(records: &[CommitRecord]) -> Result<(), String> {
     for pair in records.windows(2) {
         if pair[1].parent != pair[0].rev {
             return Err("forkstack requires a linear stack".into());
         }
     }
+    Ok(())
+}
+
+fn read_commit_range(repo: &Repository, base: Oid, head: Oid) -> Result<Vec<CommitRecord>, String> {
+    let mut walk = repo.revwalk().map_err(|error| error.message().to_owned())?;
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::REVERSE)
+        .map_err(|error| error.message().to_owned())?;
+    walk.push(head)
+        .map_err(|error| error.message().to_owned())?;
+    walk.hide(base)
+        .map_err(|error| error.message().to_owned())?;
+    let mut records = Vec::new();
+    for oid in walk {
+        let oid = oid.map_err(|error| error.message().to_owned())?;
+        let commit = repo
+            .find_commit(oid)
+            .map_err(|error| error.message().to_owned())?;
+        records.push(commit_record(&commit)?);
+    }
+    validate_linear_records(&records)?;
     Ok(records)
 }
 
-fn read_commit_range(
-    runner: &dyn CommandRunner,
-    repo: &Path,
-    range: &str,
-) -> Result<Vec<CommitRecord>, String> {
-    let format = "--format=%H%x1f%P%x1f%s%x1f%b%x1f%B%x1e";
-    parse_commit_records(&git_with(
-        runner,
-        repo,
-        &["log", "--reverse", format, range],
-    )?)
-}
-
-fn read_commits(
-    runner: &dyn CommandRunner,
-    repo: &Path,
-    revs: &[String],
-) -> Result<Vec<CommitRecord>, String> {
+fn read_commits(repo: &Repository, revs: &[String]) -> Result<Vec<CommitRecord>, String> {
     if revs.is_empty() {
         return Ok(Vec::new());
     }
-    let format = "--format=%H%x1f%P%x1f%s%x1f%b%x1f%B%x1e";
-    let mut args = vec![
-        "show".to_owned(),
-        "--no-patch".to_owned(),
-        "--no-walk=unsorted".to_owned(),
-        format.to_owned(),
-    ];
-    args.extend(revs.iter().cloned());
-    parse_commit_records(&integrations::git::run_owned(runner, repo, &args)?)
+    let mut records = Vec::with_capacity(revs.len());
+    for rev in revs {
+        let object = repo
+            .revparse_single(rev)
+            .map_err(|error| error.message().to_owned())?;
+        let commit = object
+            .peel_to_commit()
+            .map_err(|error| error.message().to_owned())?;
+        records.push(commit_record(&commit)?);
+    }
+    validate_linear_records(&records)?;
+    Ok(records)
 }
 
 pub fn identity_from_message(message: &str) -> Result<Option<String>, String> {
@@ -201,20 +200,23 @@ pub fn body_without_identity(body: &str) -> String {
 }
 
 fn remote_identities(
-    runner: &dyn CommandRunner,
-    repo: &Path,
+    repo: &Repository,
     remote: &str,
     prefix: &str,
 ) -> Result<BTreeSet<String>, String> {
-    let pattern = format!("refs/remotes/{remote}/fs-head/{prefix}/");
-    Ok(git_with(
-        runner,
-        repo,
-        &["for-each-ref", "--format=%(refname:strip=4)", &pattern],
-    )?
-    .lines()
-    .map(str::to_owned)
-    .collect())
+    let root = format!("refs/remotes/{remote}/fs-head/{prefix}/");
+    let glob = format!("{root}*");
+    let mut identities = BTreeSet::new();
+    for reference in repo
+        .references_glob(&glob)
+        .map_err(|error| error.message().to_owned())?
+    {
+        let reference = reference.map_err(|error| error.message().to_owned())?;
+        if let Some(name) = reference.name().and_then(|name| name.strip_prefix(&root)) {
+            identities.insert(format!("{prefix}/{name}"));
+        }
+    }
+    Ok(identities)
 }
 
 fn valid_branch_name(branch: &str) -> bool {
@@ -233,8 +235,7 @@ fn valid_branch_name(branch: &str) -> bool {
 }
 
 fn assign_records(
-    runner: &dyn CommandRunner,
-    repo: &Path,
+    repo: &Repository,
     records: Vec<CommitRecord>,
     remote: &str,
     prefix: Option<&str>,
@@ -264,7 +265,7 @@ fn assign_records(
         if !valid_branch_name(prefix) {
             return Err(format!("invalid identity prefix: {prefix}"));
         }
-        known.extend(remote_identities(runner, repo, remote, prefix)?);
+        known.extend(remote_identities(repo, remote, prefix)?);
         next_number = known
             .iter()
             .filter_map(|branch| branch.strip_prefix(&format!("{prefix}/"))?.parse().ok())
@@ -313,10 +314,10 @@ pub fn assign_branches(
     remote: &str,
     prefix: Option<&str>,
 ) -> Result<Vec<StackCommit>, String> {
+    let repository = open_repo(repo)?;
     assign_records(
-        &ProcessRunner,
-        repo,
-        read_commits(&ProcessRunner, repo, revs)?,
+        &repository,
+        read_commits(&repository, revs)?,
         remote,
         prefix,
     )
@@ -327,11 +328,14 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
 }
 
 fn plan_with(options: SubmitOptions, runner: &dyn CommandRunner) -> Result<SubmitPlan, String> {
-    let url = git_with(
-        runner,
-        &options.repo,
-        &["remote", "get-url", &options.remote],
-    )?;
+    let _ = runner;
+    let repo = open_repo(&options.repo)?;
+    let remote = repo
+        .find_remote(&options.remote)
+        .map_err(|error| error.message().to_owned())?;
+    let url = remote
+        .url()
+        .ok_or_else(|| format!("remote {:?} has a non-UTF-8 URL", options.remote))?;
     let fork = parse_owner_repo(&url).ok_or_else(|| {
         format!(
             "could not read owner/name from the {:?} remote URL",
@@ -339,17 +343,21 @@ fn plan_with(options: SubmitOptions, runner: &dyn CommandRunner) -> Result<Submi
         )
     })?;
     let base_ref = format!("{}/{}", options.remote, options.base);
-    let records = read_commit_range(runner, &options.repo, &format!("{base_ref}..HEAD"))?;
+    let base = repo
+        .revparse_single(&format!("refs/remotes/{}/{}", options.remote, options.base))
+        .and_then(|object| object.peel_to_commit())
+        .map_err(|error| error.message().to_owned())?
+        .id();
+    let head = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| error.message().to_owned())?
+        .id();
+    let records = read_commit_range(&repo, base, head)?;
     if records.is_empty() {
         return Err(format!("no commits in {base_ref}..HEAD"));
     }
-    let commits = assign_records(
-        runner,
-        &options.repo,
-        records,
-        &options.remote,
-        options.prefix.as_deref(),
-    )?;
+    let commits = assign_records(&repo, records, &options.remote, options.prefix.as_deref())?;
     let mut plan = SubmitPlan {
         options,
         fork,
@@ -390,13 +398,48 @@ pub mod test_support {
     }
 }
 
-fn optional_ref(repo: &Path, reference: &str) -> Option<String> {
-    git(repo, &["rev-parse", "--verify", reference]).ok()
+fn optional_ref(repo: &Repository, reference: &str) -> Option<Oid> {
+    repo.find_reference(reference)
+        .ok()
+        .and_then(|reference| reference.peel_to_commit().ok())
+        .map(|commit| commit.id())
+}
+
+fn checked_out_branches(repo: &Repository) -> Result<BTreeSet<String>, String> {
+    let mut checked_out = BTreeSet::new();
+    if let Ok(head) = repo.head() {
+        if let Some(name) = head.name() {
+            checked_out.insert(name.to_owned());
+        }
+    }
+    for name in repo
+        .worktrees()
+        .map_err(|error| error.message().to_owned())?
+        .iter()
+        .flatten()
+    {
+        let worktree = repo
+            .find_worktree(name)
+            .map_err(|error| error.message().to_owned())?;
+        let worktree_repo =
+            Repository::open(worktree.path()).map_err(|error| error.message().to_owned())?;
+        if let Ok(head) = worktree_repo.head() {
+            if let Some(name) = head.name() {
+                checked_out.insert(name.to_owned());
+            }
+        }
+    }
+    Ok(checked_out)
 }
 
 fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
-    let repo = &plan.options.repo;
-    let old_head = git(repo, &["rev-parse", "HEAD"])?;
+    let repo_path = &plan.options.repo;
+    let repo = open_repo(repo_path)?;
+    let old_head = repo
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| error.message().to_owned())?
+        .id();
     let mut new_parent: Option<String> = None;
     let mut rewritten = Vec::new();
     for step in &mut plan.commits {
@@ -407,35 +450,25 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
         let new_rev = if parent == old_parent && message == step.message {
             old_rev.clone()
         } else {
-            let fields = commit_field(
-                repo,
-                &old_rev,
-                "%T%x00%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI",
-            )?;
-            let fields: Vec<_> = fields.split('\0').collect();
-            let mut env = BTreeMap::new();
-            for (key, value) in [
-                ("GIT_AUTHOR_NAME", fields[1]),
-                ("GIT_AUTHOR_EMAIL", fields[2]),
-                ("GIT_AUTHOR_DATE", fields[3]),
-                ("GIT_COMMITTER_NAME", fields[4]),
-                ("GIT_COMMITTER_EMAIL", fields[5]),
-                ("GIT_COMMITTER_DATE", fields[6]),
-            ] {
-                env.insert(key.to_owned(), value.to_owned());
-            }
-            integrations::git::run_input(
-                &ProcessRunner,
-                repo,
-                &[
-                    "commit-tree".into(),
-                    fields[0].into(),
-                    "-p".into(),
-                    parent.clone(),
-                ],
+            let old_commit = repo
+                .find_commit(Oid::from_str(&old_rev).map_err(|error| error.message().to_owned())?)
+                .map_err(|error| error.message().to_owned())?;
+            let tree = old_commit
+                .tree()
+                .map_err(|error| error.message().to_owned())?;
+            let parent_commit = repo
+                .find_commit(Oid::from_str(&parent).map_err(|error| error.message().to_owned())?)
+                .map_err(|error| error.message().to_owned())?;
+            repo.commit(
+                None,
+                &old_commit.author(),
+                &old_commit.committer(),
                 &format!("{}\n", message.trim_end()),
-                &env,
-            )?
+                &tree,
+                &[&parent_commit],
+            )
+            .map_err(|error| error.message().to_owned())?
+            .to_string()
         };
         step.rev = new_rev.clone();
         step.parent = parent;
@@ -444,36 +477,62 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
         new_parent = Some(new_rev.clone());
         rewritten.push((old_rev, new_rev));
     }
-    for (old, new) in &rewritten {
-        if old == new {
+    let replacements: BTreeMap<Oid, Oid> = rewritten
+        .iter()
+        .filter(|(old, new)| old != new)
+        .map(|(old, new)| Ok((Oid::from_str(old)?, Oid::from_str(new)?)))
+        .collect::<Result<_, git2::Error>>()
+        .map_err(|error| error.message().to_owned())?;
+    let mut ref_updates = Vec::new();
+    for reference in repo
+        .references_glob("refs/heads/*")
+        .map_err(|error| error.message().to_owned())?
+    {
+        let reference = reference.map_err(|error| error.message().to_owned())?;
+        let (Some(name), Some(old)) = (reference.name(), reference.target()) else {
             continue;
-        }
-        let refs = git(
-            repo,
-            &[
-                "for-each-ref",
-                "--format=%(refname)",
-                "--points-at",
-                old,
-                "refs/heads/",
-            ],
-        )?;
-        for reference in refs.lines() {
-            git(repo, &["update-ref", reference, new, old])?;
+        };
+        if let Some(new) = replacements.get(&old) {
+            ref_updates.push((name.to_owned(), old, *new));
         }
     }
-    if git(repo, &["rev-parse", "HEAD"])? == old_head
-        && new_parent.as_deref() != Some(old_head.as_str())
-    {
-        git(
-            repo,
-            &[
-                "update-ref",
-                "HEAD",
-                new_parent.as_ref().unwrap(),
-                &old_head,
-            ],
-        )?;
+    let detached_head = repo
+        .head_detached()
+        .map_err(|error| error.message().to_owned())?;
+    if detached_head {
+        if let Some(new) = new_parent
+            .as_deref()
+            .filter(|new| *new != old_head.to_string())
+        {
+            ref_updates.push((
+                "HEAD".into(),
+                old_head,
+                Oid::from_str(new).map_err(|error| error.message().to_owned())?,
+            ));
+        }
+    }
+    if !ref_updates.is_empty() {
+        let mut transaction = repo
+            .transaction()
+            .map_err(|error| error.message().to_owned())?;
+        for (name, _, _) in &ref_updates {
+            transaction
+                .lock_ref(name)
+                .map_err(|error| error.message().to_owned())?;
+        }
+        for (name, old, new) in &ref_updates {
+            let current =
+                optional_ref(&repo, name).ok_or_else(|| format!("reference {name} disappeared"))?;
+            if current != *old {
+                return Err(format!("reference {name} changed while rewriting commits"));
+            }
+            transaction
+                .set_target(name, *new, None, "forkstack: record stable identity")
+                .map_err(|error| error.message().to_owned())?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| error.message().to_owned())?;
     }
     refresh_updates(plan);
     Ok(())
@@ -494,13 +553,10 @@ fn refresh_updates(plan: &mut SubmitPlan) {
 }
 
 fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
-    let repo = &plan.options.repo;
-    let checked_out: BTreeSet<_> = git(repo, &["worktree", "list", "--porcelain"])?
-        .lines()
-        .filter_map(|line| line.strip_prefix("branch "))
-        .map(str::to_owned)
-        .collect();
-    let mut input = String::new();
+    let repo_path = &plan.options.repo;
+    let repo = open_repo(repo_path)?;
+    let checked_out = checked_out_branches(&repo)?;
+    let mut updates = Vec::new();
     for step in &plan.commits {
         let local = format!("refs/heads/{}", step.head_branch());
         let remote = format!(
@@ -508,8 +564,9 @@ fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
             plan.options.remote,
             step.head_branch()
         );
-        let local_rev = optional_ref(repo, &local);
-        if local_rev.as_deref() == Some(&step.rev) {
+        let wanted = Oid::from_str(&step.rev).map_err(|error| error.message().to_owned())?;
+        let local_rev = optional_ref(&repo, &local);
+        if local_rev == Some(wanted) {
             continue;
         }
         if checked_out.contains(&local) {
@@ -519,7 +576,7 @@ fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
             ));
         }
         if let Some(old) = local_rev {
-            if optional_ref(repo, &remote).as_deref() != Some(&old) {
+            if optional_ref(&repo, &remote) != Some(old) {
                 return Err(format!(
                     "refusing to overwrite divergent local branch {:?}; it does not match {}/{}",
                     step.head_branch(),
@@ -527,38 +584,48 @@ fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
                     step.head_branch()
                 ));
             }
-            input.push_str(&format!("update {local} {} {old}\n", step.rev));
+            updates.push((local, Some(old), wanted));
         } else {
-            input.push_str(&format!("create {local} {}\n", step.rev));
+            updates.push((local, None, wanted));
         }
     }
-    if !input.is_empty() {
-        integrations::git::run_input(
-            &ProcessRunner,
-            repo,
-            &["update-ref".into(), "--stdin".into()],
-            &input,
-            &BTreeMap::new(),
-        )?;
+    if !updates.is_empty() {
+        let mut transaction = repo
+            .transaction()
+            .map_err(|error| error.message().to_owned())?;
+        for (name, _, _) in &updates {
+            transaction
+                .lock_ref(name)
+                .map_err(|error| error.message().to_owned())?;
+        }
+        for (name, old, wanted) in &updates {
+            if optional_ref(&repo, name) != *old {
+                return Err(format!("reference {name} changed while preparing updates"));
+            }
+            transaction
+                .set_target(name, *wanted, None, "forkstack: update PR head")
+                .map_err(|error| error.message().to_owned())?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| error.message().to_owned())?;
     }
+    let mut config = repo.config().map_err(|error| error.message().to_owned())?;
     for step in &plan.commits {
         let head = step.head_branch();
-        git(
-            repo,
-            &[
-                "config",
-                &format!("branch.{head}.remote"),
-                &plan.options.remote,
-            ],
-        )?;
-        git(
-            repo,
-            &[
-                "config",
-                &format!("branch.{head}.merge"),
-                &format!("refs/heads/{head}"),
-            ],
-        )?;
+        let remote_key = format!("branch.{head}.remote");
+        let merge_key = format!("branch.{head}.merge");
+        if config.get_string(&remote_key).as_deref() != Ok(plan.options.remote.as_str()) {
+            config
+                .set_str(&remote_key, &plan.options.remote)
+                .map_err(|error| error.message().to_owned())?;
+        }
+        let merge = format!("refs/heads/{head}");
+        if config.get_string(&merge_key).as_deref() != Ok(merge.as_str()) {
+            config
+                .set_str(&merge_key, &merge)
+                .map_err(|error| error.message().to_owned())?;
+        }
     }
     Ok(())
 }
