@@ -402,6 +402,14 @@ pub mod test_support {
         super::prepare_with(options, expected, runner)
     }
 
+    pub fn execute_with_links(
+        plan: &mut SubmitPlan,
+        runner: &dyn CommandRunner,
+        report: &mut dyn FnMut(&str),
+    ) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
+        super::execute_with_links(plan, runner, report)
+    }
+
     pub fn valid_branch_name(branch: &str) -> bool {
         super::valid_branch_name(branch)
     }
@@ -653,11 +661,17 @@ pub fn stack_table(entries: &[(String, Option<u64>, String)], current: &str) -> 
 }
 
 pub fn execute_checked(expected: &SubmitPlan) -> Result<(), String> {
+    execute_checked_with_links(expected).map(|_| ())
+}
+
+pub fn execute_checked_with_links(
+    expected: &SubmitPlan,
+) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
     let fresh = prepare(expected.options.clone(), Some(expected))?;
     if &fresh != expected {
         return Err("publish plan changed after fetch; press p to preview the fresh plan".into());
     }
-    execute_silent(fresh)
+    execute_silent_with_links(fresh)
 }
 
 pub fn prepare(
@@ -725,8 +739,10 @@ pub fn execute(mut plan: SubmitPlan) -> Result<(), String> {
     })
 }
 
-fn execute_silent(mut plan: SubmitPlan) -> Result<(), String> {
-    execute_with(&mut plan, &ProcessRunner, &mut |_| {})
+fn execute_silent_with_links(
+    mut plan: SubmitPlan,
+) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
+    execute_with_links(&mut plan, &ProcessRunner, &mut |_| {})
 }
 
 pub fn execute_with(
@@ -734,6 +750,14 @@ pub fn execute_with(
     runner: &dyn CommandRunner,
     report: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
+    execute_with_links(plan, runner, report).map(|_| ())
+}
+
+fn execute_with_links(
+    plan: &mut SubmitPlan,
+    runner: &dyn CommandRunner,
+    report: &mut dyn FnMut(&str),
+) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
     let heads: Vec<_> = plan.commits.iter().map(StackCommit::head_branch).collect();
     let mut discovery =
         integrations::github::discover_prs(runner, &plan.options.repo, &plan.fork, &heads)?;
@@ -848,7 +872,22 @@ pub fn execute_with(
         plan.commits.len(),
         plan.fork
     ));
-    Ok(())
+    Ok(heads
+        .into_iter()
+        .zip(prs)
+        .filter_map(|(head, pr)| {
+            pr.map(|pr| {
+                (
+                    head,
+                    integrations::github::PullRequestLink {
+                        number: pr.number,
+                        head_ref_name: pr.head_ref_name,
+                        url: pr.url,
+                    },
+                )
+            })
+        })
+        .collect())
 }
 
 pub fn print_summary(plan: &SubmitPlan) {

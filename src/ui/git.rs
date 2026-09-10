@@ -510,6 +510,7 @@ pub struct Response {
     pub graph: Result<Graph, String>,
     pub preview: Option<Graph>,
     pub publish_plan: Option<crate::core::submit::SubmitPlan>,
+    pub published_links: Option<BTreeMap<String, PullRequestLink>>,
     pub operation_error: Option<String>,
 }
 
@@ -607,6 +608,7 @@ pub fn worker(
     while let Ok(request) = requests.recv() {
         let mut preview = None;
         let mut publish_plan = None;
+        let mut published_links = None;
         let mut loaded_graph = None;
         let operation = match request {
             Request::Load => None,
@@ -637,7 +639,15 @@ pub fn worker(
                     Err(error) => Some(error),
                 }
             }
-            Request::PublishExecute(plan) => crate::core::submit::execute_checked(&plan).err(),
+            Request::PublishExecute(plan) => {
+                match crate::core::submit::execute_checked_with_links(&plan) {
+                    Ok(links) => {
+                        published_links = Some(remote_pr_links(&plan.options.remote, links));
+                        None
+                    }
+                    Err(error) => Some(error),
+                }
+            }
             Request::Stop => break,
         };
         let graph =
@@ -647,6 +657,7 @@ pub fn worker(
                 graph,
                 preview,
                 publish_plan,
+                published_links,
                 operation_error: operation,
             })
             .is_err()

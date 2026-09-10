@@ -925,7 +925,17 @@ fn execute_creates_and_then_restacks_pull_requests() {
     let options = options(&fixture.repo);
 
     let mut first_plan = plan(options.clone()).unwrap();
-    execute_with(&mut first_plan, &runner, &mut |_| {}).unwrap();
+    let published_links =
+        test_support::execute_with_links(&mut first_plan, &runner, &mut |_| {}).unwrap();
+    assert_eq!(
+        published_links.keys().cloned().collect::<Vec<_>>(),
+        ["fs-head/draft/1", "fs-head/draft/2"]
+    );
+    assert_eq!(published_links["fs-head/draft/1"].number, 101);
+    assert_eq!(
+        published_links["fs-head/draft/2"].url,
+        "https://github.com/example/repo/pull/102"
+    );
     fetch_all(&fixture.repo);
     let seeded: Vec<_> = git(
         &fixture.repo,

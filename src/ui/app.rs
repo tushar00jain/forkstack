@@ -173,6 +173,7 @@ pub struct App {
     link_responses: Receiver<LinkResponse>,
     link_generation: u64,
     link_status: Option<String>,
+    refresh_links_after_load: bool,
     quit: bool,
     scroll: usize,
     rendered: Vec<RenderedLine>,
@@ -211,6 +212,7 @@ impl App {
             link_responses: link_response_rx,
             link_generation: 0,
             link_status: None,
+            refresh_links_after_load: false,
             quit: false,
             scroll: 0,
             rendered: Vec::new(),
@@ -374,7 +376,7 @@ impl App {
         self.status = Some("refreshing…".into());
         self.status_error = false;
         self.busy = Some(Busy::Load);
-        let _ = self.requests.send(Request::Load);
+        self.refresh_links_after_load = self.requests.send(Request::Load).is_ok();
     }
 
     fn preview_publish(&mut self) {
@@ -513,6 +515,7 @@ impl App {
     fn receive(&mut self) {
         while let Ok(response) = self.responses.try_recv() {
             let mutation = self.busy == Some(Busy::Mutation);
+            let published_links = response.published_links;
             self.busy = None;
             match response.graph {
                 Ok(graph) => {
@@ -520,6 +523,11 @@ impl App {
                     self.graph = Some(graph);
                     self.preview = response.preview;
                     self.publish_plan = response.publish_plan;
+                    if let Some(links) = published_links {
+                        self.link_generation = self.link_generation.wrapping_add(1);
+                        self.pr_links = links;
+                        self.link_status = None;
+                    }
                     if mutation {
                         self.carried = None;
                         self.carried_commits.clear();
@@ -532,16 +540,23 @@ impl App {
                         .or_else(|| ids.first().cloned());
                     self.status_error = response.operation_error.is_some();
                     self.status = response.operation_error;
-                    self.request_pr_links();
+                    if std::mem::take(&mut self.refresh_links_after_load) {
+                        self.request_pr_links();
+                    }
                     self.update_rendered();
                 }
                 Err(error) => {
+                    self.refresh_links_after_load = false;
                     self.link_generation = self.link_generation.wrapping_add(1);
-                    self.pr_links.clear();
+                    if let Some(links) = published_links {
+                        self.pr_links = links;
+                    } else {
+                        self.pr_links.clear();
+                    }
                     self.link_status = None;
                     self.status = Some(response.operation_error.unwrap_or(error));
                     self.status_error = true;
-                    self.dirty = true;
+                    self.update_rendered();
                 }
             }
         }
@@ -710,6 +725,57 @@ impl App {
 mod tests {
     use super::*;
 
+    fn test_app() -> (
+        App,
+        Receiver<Request>,
+        Sender<Response>,
+        Receiver<LinkRequest>,
+    ) {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let (link_request_tx, link_request_rx) = mpsc::channel();
+        let (_link_response_tx, link_response_rx) = mpsc::channel();
+        let app = App {
+            graph: None,
+            preview: None,
+            selected: None,
+            carried: None,
+            carried_commits: HashSet::new(),
+            carry_substack: false,
+            pending: None,
+            publish_options: SubmitOptions::default(),
+            publish_plan: None,
+            search: Search::default(),
+            status: None,
+            status_error: false,
+            busy: None,
+            requests: request_tx,
+            responses: response_rx,
+            link_requests: link_request_tx,
+            link_responses: link_response_rx,
+            link_generation: 0,
+            link_status: None,
+            refresh_links_after_load: false,
+            quit: false,
+            scroll: 0,
+            rendered: Vec::new(),
+            pr_links: BTreeMap::new(),
+            help_open: false,
+            dirty: false,
+        };
+        (app, request_rx, response_tx, link_request_rx)
+    }
+
+    fn graph_response() -> Response {
+        Response {
+            graph: Ok(Graph::default()),
+            preview: None,
+            publish_plan: None,
+            published_links: None,
+            operation_error: None,
+        }
+    }
+
     #[test]
     fn move_bindings_use_lowercase_for_commit_and_uppercase_for_substack() {
         assert_eq!(
@@ -829,6 +895,85 @@ mod tests {
 
         assert!(!current_link_response(5, &stale));
         assert!(current_link_response(5, &current));
+    }
+
+    #[test]
+    fn graph_load_does_not_fetch_pr_links_without_explicit_refresh() {
+        let (mut app, _requests, responses, link_requests) = test_app();
+        responses.send(graph_response()).unwrap();
+
+        app.receive();
+
+        assert!(matches!(
+            link_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn explicit_refresh_fetches_pr_links_once_after_loading_the_graph() {
+        let (mut app, requests, responses, link_requests) = test_app();
+
+        app.refresh();
+        assert!(matches!(requests.recv().unwrap(), Request::Load));
+        responses.send(graph_response()).unwrap();
+        app.receive();
+
+        assert!(matches!(
+            link_requests.recv().unwrap(),
+            LinkRequest::Load { generation: 1, .. }
+        ));
+        assert!(matches!(
+            link_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn normal_graph_updates_keep_existing_pr_links_without_refetching() {
+        let (mut app, _requests, responses, link_requests) = test_app();
+        app.pr_links.insert(
+            "origin/fs-head/topic/1".into(),
+            PullRequestLink {
+                number: 1,
+                head_ref_name: "fs-head/topic/1".into(),
+                url: "https://example.invalid/1".into(),
+            },
+        );
+        responses.send(graph_response()).unwrap();
+
+        app.receive();
+
+        assert_eq!(app.pr_links.len(), 1);
+        assert!(matches!(
+            link_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn successful_publish_updates_pr_links_without_refetching() {
+        let (mut app, _requests, responses, link_requests) = test_app();
+        let link = PullRequestLink {
+            number: 1,
+            head_ref_name: "fs-head/topic/1".into(),
+            url: "https://example.invalid/1".into(),
+        };
+        responses
+            .send(Response {
+                published_links: Some([("origin/fs-head/topic/1".into(), link.clone())].into()),
+                ..graph_response()
+            })
+            .unwrap();
+
+        app.receive();
+
+        assert_eq!(app.pr_links.get("origin/fs-head/topic/1"), Some(&link));
+        assert_eq!(app.link_generation, 1);
+        assert!(matches!(
+            link_requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 
     #[test]
