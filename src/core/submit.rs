@@ -57,7 +57,6 @@ pub struct SubmitPlan {
     pub options: SubmitOptions,
     pub fork: String,
     pub base_ref: String,
-    pub root: String,
     pub commits: Vec<StackCommit>,
     pub updates: Vec<RefUpdate>,
 }
@@ -242,30 +241,15 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
         &options.remote,
         options.prefix.as_deref(),
     )?;
-    let root = git(&options.repo, &["rev-parse", &base_ref])?;
-    let mut updates = Vec::new();
-    for (index, step) in commits.iter().enumerate() {
-        updates.push(RefUpdate {
-            branch: step.base_branch(),
-            rev: if index == 0 {
-                root.clone()
-            } else {
-                commits[index - 1].rev.clone()
-            },
-        });
-        updates.push(RefUpdate {
-            branch: step.head_branch(),
-            rev: step.rev.clone(),
-        });
-    }
-    Ok(SubmitPlan {
+    let mut plan = SubmitPlan {
         options,
         fork,
         base_ref,
-        root,
         commits,
-        updates,
-    })
+        updates: Vec::new(),
+    };
+    refresh_updates(&mut plan)?;
+    Ok(plan)
 }
 
 fn optional_ref(repo: &Path, reference: &str) -> Option<String> {
@@ -347,26 +331,26 @@ fn rewrite_with_identities(plan: &mut SubmitPlan) -> Result<(), String> {
             ],
         )?;
     }
-    refresh_updates(plan);
+    refresh_updates(plan)?;
     Ok(())
 }
 
-fn refresh_updates(plan: &mut SubmitPlan) {
+fn refresh_updates(plan: &mut SubmitPlan) -> Result<(), String> {
     plan.updates.clear();
-    for (index, step) in plan.commits.iter().enumerate() {
+    for step in &plan.commits {
         plan.updates.push(RefUpdate {
             branch: step.base_branch(),
-            rev: if index == 0 {
-                plan.root.clone()
-            } else {
-                plan.commits[index - 1].rev.clone()
-            },
+            rev: git(
+                &plan.options.repo,
+                &["rev-parse", &format!("{}^", step.rev)],
+            )?,
         });
         plan.updates.push(RefUpdate {
             branch: step.head_branch(),
             rev: step.rev.clone(),
         });
     }
+    Ok(())
 }
 
 fn sync_local_heads(plan: &SubmitPlan) -> Result<(), String> {
@@ -803,6 +787,24 @@ mod tests {
         }
     }
 
+    fn advance_remote_main(fixture: &Fixture) -> String {
+        test_git(&fixture.repo, &["switch", "--detach", &fixture.base]);
+        fs::write(fixture.repo.join("advanced"), "advanced main\n").unwrap();
+        test_git(&fixture.repo, &["add", "advanced"]);
+        test_git(&fixture.repo, &["commit", "-m", "advanced main"]);
+        let advanced = test_git(&fixture.repo, &["rev-parse", "HEAD"]);
+        test_git(
+            &fixture.repo,
+            &["push", "origin", &format!("{advanced}:refs/heads/main")],
+        );
+        test_git(
+            &fixture.repo,
+            &["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"],
+        );
+        test_git(&fixture.repo, &["switch", "main"]);
+        advanced
+    }
+
     #[test]
     fn parses_identity_and_removes_it_from_body() {
         let message = "subject\n\nbody\n\nfs-branch: draft/2\n";
@@ -868,6 +870,95 @@ mod tests {
     }
 
     #[test]
+    fn diverged_remote_base_uses_each_head_commits_actual_parent() {
+        let fixture = fixture();
+        let advanced = advance_remote_main(&fixture);
+        for branch in [
+            "fs-base/draft/1",
+            "fs-head/draft/1",
+            "fs-base/draft/2",
+            "fs-head/draft/2",
+        ] {
+            test_git(
+                &fixture.repo,
+                &[
+                    "update-ref",
+                    &format!("refs/remotes/origin/{branch}"),
+                    &advanced,
+                ],
+            );
+        }
+
+        let plan = plan(SubmitOptions {
+            repo: fixture.repo.clone(),
+            remote: "origin".into(),
+            base: "main".into(),
+            prefix: Some("draft".into()),
+            draft: true,
+        })
+        .unwrap();
+
+        assert_eq!(plan.base_ref, "origin/main");
+        assert_eq!(plan.commits[0].rev, fixture.first);
+        assert_eq!(plan.commits[1].rev, fixture.second);
+        assert_eq!(plan.updates[0].rev, fixture.base);
+        assert_eq!(plan.updates[2].rev, fixture.first);
+        for step in &plan.commits {
+            let base = plan
+                .updates
+                .iter()
+                .find(|update| update.branch == step.base_branch())
+                .unwrap();
+            assert_eq!(
+                base.rev,
+                test_git(&fixture.repo, &["rev-parse", &format!("{}^", step.rev)])
+            );
+        }
+
+        let graph = crate::ui::git::load_graph(&fixture.repo).unwrap();
+        let preview = graph.publish_preview(&plan).unwrap();
+        assert!(
+            preview.commits[&advanced]
+                .remote_refs
+                .contains(&"origin/main".into())
+        );
+        assert!(
+            preview.commits[&advanced]
+                .remote_refs
+                .iter()
+                .all(|name| !name.contains("/fs-base/") && !name.contains("/fs-head/"))
+        );
+        assert!(
+            preview.commits[&fixture.base]
+                .remote_refs
+                .contains(&"origin/fs-base/draft/1".into())
+        );
+        assert!(
+            preview.commits[&fixture.first]
+                .remote_refs
+                .contains(&"origin/fs-base/draft/2".into())
+        );
+        assert!(
+            preview.commits[&fixture.first]
+                .remote_refs
+                .contains(&"origin/fs-head/draft/1".into())
+        );
+        assert!(
+            preview.commits[&fixture.second]
+                .remote_refs
+                .contains(&"origin/fs-head/draft/2".into())
+        );
+        assert_eq!(
+            preview.commits[&fixture.first].parents,
+            [fixture.base.clone()]
+        );
+        assert_eq!(
+            preview.commits[&fixture.second].parents,
+            [fixture.first.clone()]
+        );
+    }
+
+    #[test]
     fn identity_follows_change_when_reordered() {
         let fixture = fixture();
         let mut plan = SubmitPlan {
@@ -880,7 +971,6 @@ mod tests {
             },
             fork: "test/remote".into(),
             base_ref: "origin/main".into(),
-            root: fixture.base.clone(),
             commits: assign_branches(
                 &fixture.repo,
                 &[fixture.first.clone(), fixture.second.clone()],
@@ -991,7 +1081,6 @@ mod tests {
             },
             fork: "test/remote".into(),
             base_ref: "origin/main".into(),
-            root: fixture.base.clone(),
             commits: vec![StackCommit {
                 rev: fixture.first.clone(),
                 branch: "draft/1".into(),

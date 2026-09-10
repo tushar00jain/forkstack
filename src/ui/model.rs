@@ -592,7 +592,6 @@ mod tests {
             },
             fork: "example/repo".into(),
             base_ref: "origin/main".into(),
-            root: "a".into(),
             commits: Vec::new(),
             updates: vec![
                 crate::core::submit::RefUpdate {

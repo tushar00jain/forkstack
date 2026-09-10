@@ -1,3 +1,5 @@
+"""Tests for the disposable Forkstack fixture generator."""
+
 import subprocess
 import tempfile
 import unittest

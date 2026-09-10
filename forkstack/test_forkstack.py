@@ -1,3 +1,5 @@
+"""Tests for the legacy Python Forkstack implementation."""
+
 import argparse
 import json
 import subprocess
