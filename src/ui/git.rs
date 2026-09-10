@@ -3,7 +3,6 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::mpsc::{Receiver, Sender};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{Oid, Repository, RepositoryState, Sort};
@@ -495,37 +494,6 @@ pub fn apply_move_with_test_executable(
     apply_move_with_executable(repo, plan, executable)
 }
 
-#[derive(Debug)]
-pub enum Request {
-    Load,
-    Checkout(String),
-    Apply(MovePlan),
-    PublishPreview(crate::core::submit::SubmitOptions),
-    PublishExecute(crate::core::submit::SubmitPlan),
-    Stop,
-}
-
-#[derive(Debug)]
-pub struct Response {
-    pub graph: Result<Graph, String>,
-    pub preview: Option<Graph>,
-    pub publish_plan: Option<crate::core::submit::SubmitPlan>,
-    pub published_links: Option<BTreeMap<String, PullRequestLink>>,
-    pub operation_error: Option<String>,
-}
-
-#[derive(Debug)]
-pub enum LinkRequest {
-    Load { generation: u64, heads: Vec<String> },
-    Stop,
-}
-
-#[derive(Debug)]
-pub struct LinkResponse {
-    pub generation: u64,
-    pub result: Result<BTreeMap<String, PullRequestLink>, String>,
-}
-
 pub(crate) fn displayed_remote_heads(graph: &Graph, remote: &str) -> Vec<String> {
     let prefix = format!("{remote}/fs-head/");
     graph
@@ -541,7 +509,7 @@ pub(crate) fn displayed_remote_heads(graph: &Graph, remote: &str) -> Vec<String>
         .collect()
 }
 
-fn load_pr_links(
+pub(crate) fn load_pr_links(
     options: &crate::core::submit::SubmitOptions,
     heads: &[String],
 ) -> Result<BTreeMap<String, PullRequestLink>, String> {
@@ -553,42 +521,7 @@ fn load_pr_links(
     Ok(remote_pr_links(&options.remote, found))
 }
 
-pub fn link_worker(
-    options: crate::core::submit::SubmitOptions,
-    requests: Receiver<LinkRequest>,
-    responses: Sender<LinkResponse>,
-) {
-    while let Ok(request) = requests.recv() {
-        let LinkRequest::Load {
-            mut generation,
-            mut heads,
-        } = request
-        else {
-            break;
-        };
-        // If several graph generations arrived while the previous network
-        // request was running, skip directly to the newest presentation.
-        while let Ok(request) = requests.try_recv() {
-            match request {
-                LinkRequest::Load {
-                    generation: newer_generation,
-                    heads: newer_heads,
-                } => {
-                    generation = newer_generation;
-                    heads = newer_heads;
-                }
-                LinkRequest::Stop => return,
-            }
-        }
-        let result = load_pr_links(&options, &heads)
-            .map_err(|error| format!("PR links unavailable: {error}"));
-        if responses.send(LinkResponse { generation, result }).is_err() {
-            break;
-        }
-    }
-}
-
-fn remote_pr_links(
+pub(crate) fn remote_pr_links(
     remote: &str,
     found: BTreeMap<String, PullRequestLink>,
 ) -> BTreeMap<String, PullRequestLink> {
@@ -597,74 +530,6 @@ fn remote_pr_links(
         .filter(|(head, pr)| pr.head_ref_name == *head)
         .map(|(head, pr)| (format!("{remote}/{head}"), pr))
         .collect()
-}
-
-pub fn worker(
-    options: crate::core::submit::SubmitOptions,
-    requests: Receiver<Request>,
-    responses: Sender<Response>,
-) {
-    let repo = options.repo.clone();
-    while let Ok(request) = requests.recv() {
-        let mut preview = None;
-        let mut publish_plan = None;
-        let mut published_links = None;
-        let mut loaded_graph = None;
-        let operation = match request {
-            Request::Load => None,
-            Request::Checkout(id) => checkout(&repo, &id).err(),
-            Request::Apply(plan) => apply_move(&repo, &plan).err(),
-            Request::PublishPreview(publish_options) => {
-                let remote = publish_options.remote.clone();
-                let base = publish_options.base.clone();
-                match crate::core::submit::plan(publish_options) {
-                    Ok(plan) => match load_graph_for(&repo, &remote, &base) {
-                        Ok(graph) => match graph.publish_preview(&plan) {
-                            Ok(publish_preview) => {
-                                loaded_graph = Some(Ok(graph));
-                                preview = Some(publish_preview);
-                                publish_plan = Some(plan);
-                                None
-                            }
-                            Err(error) => {
-                                loaded_graph = Some(Ok(graph));
-                                Some(error)
-                            }
-                        },
-                        Err(error) => {
-                            loaded_graph = Some(Err(error.clone()));
-                            Some(error)
-                        }
-                    },
-                    Err(error) => Some(error),
-                }
-            }
-            Request::PublishExecute(plan) => {
-                match crate::core::submit::execute_checked_with_links(&plan) {
-                    Ok(links) => {
-                        published_links = Some(remote_pr_links(&plan.options.remote, links));
-                        None
-                    }
-                    Err(error) => Some(error),
-                }
-            }
-            Request::Stop => break,
-        };
-        let graph =
-            loaded_graph.unwrap_or_else(|| load_graph_for(&repo, &options.remote, &options.base));
-        if responses
-            .send(Response {
-                graph,
-                preview,
-                publish_plan,
-                published_links,
-                operation_error: operation,
-            })
-            .is_err()
-        {
-            break;
-        }
-    }
 }
 
 #[cfg(test)]

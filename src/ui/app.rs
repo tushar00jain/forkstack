@@ -1,11 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Stdout, Write};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
-use std::time::Duration;
+use std::sync::mpsc::{Receiver, Sender};
 
 use crossterm::cursor::MoveTo;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{
     Attribute as TerminalAttribute, Color as TerminalColor, Colors, Print, SetAttribute, SetColors,
 };
@@ -22,9 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::core::submit::{SubmitOptions, SubmitPlan};
 use crate::integrations::github::PullRequestLink;
-use crate::ui::git::{
-    LinkRequest, LinkResponse, Request, Response, displayed_remote_heads, link_worker, worker,
-};
+use crate::ui::event::{self, Operation, OperationResult, UiEvent};
 use crate::ui::model::{Graph, MovePlan};
 use crate::ui::render::{RenderedLine, TextKind, attach_pr_links, commit_label, render_graph};
 
@@ -60,17 +56,6 @@ fn help_transition(open: bool, key: &KeyEvent) -> Option<bool> {
         Some(!matches!(key.code, KeyCode::Char('?') | KeyCode::Esc))
     } else {
         (key.code == KeyCode::Char('?')).then_some(true)
-    }
-}
-
-fn current_link_response(generation: u64, response: &LinkResponse) -> bool {
-    response.generation == generation
-}
-
-fn link_request(generation: u64, graph: &Graph, remote: &str) -> LinkRequest {
-    LinkRequest::Load {
-        generation,
-        heads: displayed_remote_heads(graph, remote),
     }
 }
 
@@ -248,13 +233,9 @@ pub struct App {
     status: Option<String>,
     status_error: bool,
     busy: Option<Busy>,
-    requests: Sender<Request>,
-    responses: Receiver<Response>,
-    link_requests: Sender<LinkRequest>,
-    link_responses: Receiver<LinkResponse>,
-    link_generation: u64,
-    link_status: Option<String>,
-    refresh_links_after_load: bool,
+    operations: Sender<Operation>,
+    events: Receiver<UiEvent>,
+    input_events: Option<Sender<UiEvent>>,
     quit: bool,
     scroll: usize,
     rendered: Vec<RenderedLine>,
@@ -265,14 +246,7 @@ pub struct App {
 
 impl App {
     pub fn new(publish_options: SubmitOptions) -> Self {
-        let worker_options = publish_options.clone();
-        let (request_tx, request_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
-        thread::spawn(move || worker(worker_options, request_rx, response_tx));
-        let link_worker_options = publish_options.clone();
-        let (link_request_tx, link_request_rx) = mpsc::channel();
-        let (link_response_tx, link_response_rx) = mpsc::channel();
-        thread::spawn(move || link_worker(link_worker_options, link_request_rx, link_response_tx));
+        let event_loop = event::start(publish_options.clone());
         let app = Self {
             graph: None,
             preview: None,
@@ -287,13 +261,9 @@ impl App {
             status: None,
             status_error: false,
             busy: Some(Busy::Load),
-            requests: request_tx,
-            responses: response_rx,
-            link_requests: link_request_tx,
-            link_responses: link_response_rx,
-            link_generation: 0,
-            link_status: None,
-            refresh_links_after_load: false,
+            operations: event_loop.operations,
+            events: event_loop.events,
+            input_events: Some(event_loop.input_events),
             quit: false,
             scroll: 0,
             rendered: Vec::new(),
@@ -301,7 +271,7 @@ impl App {
             help_open: false,
             dirty: true,
         };
-        let _ = app.requests.send(Request::Load);
+        let _ = app.operations.send(Operation::Load);
         app
     }
 
@@ -328,19 +298,6 @@ impl App {
         self.dirty = true;
     }
 
-    fn request_pr_links(&mut self) {
-        self.link_generation = self.link_generation.wrapping_add(1);
-        self.pr_links.clear();
-        self.link_status = None;
-        if let Some(graph) = self.active_graph() {
-            let _ = self.link_requests.send(link_request(
-                self.link_generation,
-                graph,
-                &self.publish_options.remote,
-            ));
-        }
-    }
-
     fn clear_preview(&mut self, keep_carried: bool) {
         let had_preview = self.preview.take().is_some();
         self.pending = None;
@@ -352,6 +309,30 @@ impl App {
         if had_preview {
             self.update_rendered();
         }
+    }
+
+    fn start_operation(&mut self, operation: Operation, busy: Busy, status: &str) -> bool {
+        if self.busy.is_some() {
+            self.reject_busy_operation();
+            return false;
+        }
+        if self.operations.send(operation).is_err() {
+            self.status = Some("operation worker is unavailable".into());
+            self.status_error = true;
+            self.dirty = true;
+            return false;
+        }
+        self.busy = Some(busy);
+        self.status = Some(status.into());
+        self.status_error = false;
+        self.dirty = true;
+        true
+    }
+
+    fn reject_busy_operation(&mut self) {
+        self.status = Some("another operation is already running".into());
+        self.status_error = true;
+        self.dirty = true;
     }
 
     fn move_cursor(&mut self, amount: isize) {
@@ -400,9 +381,6 @@ impl App {
     }
 
     fn enter(&mut self) {
-        if self.busy.is_some() {
-            return;
-        }
         if self.pending.is_some() {
             self.apply();
             return;
@@ -436,68 +414,61 @@ impl App {
                     self.status_error = true;
                 }
             }
-        } else if self.requests.send(Request::Checkout(selected)).is_ok() {
-            self.busy = Some(Busy::Mutation);
-            self.status = Some("checking out…".into());
-            self.status_error = false;
+        } else {
+            self.start_operation(
+                Operation::Checkout(selected),
+                Busy::Mutation,
+                "checking out…",
+            );
         }
     }
 
     fn apply(&mut self) {
-        if self.busy.is_some() {
-            return;
-        }
-        let Some(plan) = self.pending.take() else {
+        let Some(plan) = self.pending.clone() else {
             return;
         };
-        if self.requests.send(Request::Apply(plan)).is_ok() {
-            self.busy = Some(Busy::Mutation);
-            self.status = Some("applying…".into());
-            self.status_error = false;
+        if self.start_operation(Operation::Apply(plan), Busy::Mutation, "applying…") {
+            self.pending = None;
         }
     }
 
     fn refresh(&mut self) {
         if self.busy.is_some() {
+            self.start_operation(Operation::Refresh, Busy::Load, "refreshing…");
             return;
         }
         self.clear_preview(false);
-        self.status = Some("refreshing…".into());
-        self.status_error = false;
-        self.busy = Some(Busy::Load);
-        self.refresh_links_after_load = self.requests.send(Request::Load).is_ok();
+        self.start_operation(Operation::Refresh, Busy::Load, "refreshing…");
     }
 
     fn preview_publish(&mut self) {
         if self.busy.is_some() {
+            self.start_operation(
+                Operation::PublishPreview(self.publish_options.clone()),
+                Busy::Load,
+                "planning publish…",
+            );
             return;
         }
         self.clear_preview(false);
-        if self
-            .requests
-            .send(Request::PublishPreview(self.publish_options.clone()))
-            .is_ok()
-        {
-            self.busy = Some(Busy::Load);
-            self.status = Some("planning publish…".into());
-            self.status_error = false;
-        }
+        self.start_operation(
+            Operation::PublishPreview(self.publish_options.clone()),
+            Busy::Load,
+            "planning publish…",
+        );
     }
 
     fn execute_publish(&mut self) {
-        if self.busy.is_some() {
-            return;
-        }
         let Some(plan) = self.publish_plan.clone() else {
             self.status = Some("press p to preview publish changes first".into());
             self.status_error = true;
             return;
         };
-        if self.requests.send(Request::PublishExecute(plan)).is_ok() {
-            self.busy = Some(Busy::Mutation);
-            self.status = Some("publishing…".into());
-            self.status_error = false;
-        }
+        self.start_operation(
+            Operation::PublishExecute(plan),
+            Busy::Mutation,
+            "publishing…",
+        );
     }
 
     fn update_search(&mut self) {
@@ -539,7 +510,7 @@ impl App {
         self.selected = Some(self.search.matches[index].clone());
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) {
+    fn handle_search_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc => self.search.editing = false,
             KeyCode::Enter => {
@@ -555,22 +526,32 @@ impl App {
                 self.search.query.push(character);
                 self.update_search();
             }
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, key: KeyEvent) -> bool {
         if let Some(open) = help_transition(self.help_open, &key) {
+            let changed = self.help_open != open;
             self.help_open = open;
-            return;
+            return changed;
         }
         if self.search.editing {
-            self.handle_search_key(key);
-            return;
+            return self.handle_search_key(key);
+        }
+        if self.busy.is_some()
+            && matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'q')
+            )
+        {
+            self.reject_busy_operation();
+            return true;
         }
         if let Some(substack) = move_pick(&key) {
             self.pick(substack);
-            return;
+            return true;
         }
         match (key.code, key.modifiers) {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
@@ -590,91 +571,58 @@ impl App {
             (KeyCode::Char('N'), _) => self.next_match(true),
             (KeyCode::Char('n'), _) => self.next_match(false),
             (KeyCode::Char('r'), _) => self.refresh(),
-            (KeyCode::Char('q'), _) if self.busy == Some(Busy::Mutation) => {
-                self.status = Some("a Git operation is still running".into());
-                self.status_error = true;
-            }
             (KeyCode::Char('q'), _) => self.quit = true,
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
-    fn receive(&mut self) {
-        while let Ok(response) = self.responses.try_recv() {
-            let mutation = self.busy == Some(Busy::Mutation);
-            let published_links = response.published_links;
-            self.busy = None;
-            match response.graph {
-                Ok(graph) => {
-                    let old = self.selected.clone();
-                    self.graph = Some(graph);
-                    self.preview = response.preview;
-                    self.publish_plan = response.publish_plan;
-                    if let Some(links) = published_links {
-                        self.link_generation = self.link_generation.wrapping_add(1);
-                        self.pr_links = links;
-                        self.link_status = None;
-                    }
-                    if mutation {
-                        self.carried = None;
-                        self.carried_commits.clear();
-                        self.pending = None;
-                        self.publish_plan = None;
-                    }
-                    let ids = self.graph_ids();
-                    self.selected = old
-                        .filter(|id| ids.contains(id))
-                        .or_else(|| ids.first().cloned());
-                    self.status_error = response.operation_error.is_some();
-                    self.status = response.operation_error;
-                    if std::mem::take(&mut self.refresh_links_after_load) {
-                        self.request_pr_links();
-                    }
-                    self.update_rendered();
+    fn receive(&mut self, response: OperationResult) {
+        let mutation = self.busy == Some(Busy::Mutation);
+        let updates_links = response.pr_links.is_some();
+        self.busy = None;
+        match response.graph {
+            Ok(graph) => {
+                let old = self.selected.clone();
+                self.graph = Some(graph);
+                self.preview = response.preview;
+                self.publish_plan = response.publish_plan;
+                if mutation {
+                    self.carried = None;
+                    self.carried_commits.clear();
+                    self.pending = None;
+                    self.publish_plan = None;
                 }
-                Err(error) => {
-                    self.refresh_links_after_load = false;
-                    self.link_generation = self.link_generation.wrapping_add(1);
-                    if let Some(links) = published_links {
-                        self.pr_links = links;
-                    } else {
-                        self.pr_links.clear();
-                    }
-                    self.link_status = None;
-                    self.status = Some(response.operation_error.unwrap_or(error));
-                    self.status_error = true;
-                    self.update_rendered();
+                let ids = self.graph_ids();
+                self.selected = old
+                    .filter(|id| ids.contains(id))
+                    .or_else(|| ids.first().cloned());
+                self.status_error = response.operation_error.is_some();
+                self.status = response.operation_error;
+            }
+            Err(error) => {
+                if !updates_links {
+                    self.pr_links.clear();
                 }
+                self.status = Some(response.operation_error.unwrap_or(error));
+                self.status_error = true;
             }
         }
-        while let Ok(response) = self.link_responses.try_recv() {
-            if !current_link_response(self.link_generation, &response) {
-                continue;
-            }
-            match response.result {
+        if let Some(result) = response.pr_links {
+            match result {
                 Ok(links) => {
                     self.pr_links = links;
-                    if self
-                        .link_status
-                        .as_ref()
-                        .is_some_and(|message| self.status.as_ref() == Some(message))
-                    {
-                        self.status = None;
-                    }
-                    self.link_status = None;
-                    self.update_rendered();
                 }
                 Err(error) => {
                     self.pr_links.clear();
                     if self.status.is_none() {
-                        self.status = Some(error.clone());
+                        self.status = Some(error);
                         self.status_error = false;
-                        self.link_status = Some(error);
                     }
-                    self.update_rendered();
                 }
             }
         }
+        self.update_rendered();
     }
 
     fn draw(&mut self, terminal: &mut Tui) -> io::Result<()> {
@@ -782,29 +730,34 @@ impl App {
         execute!(stdout, EnterAlternateScreen).map_err(|error| error.to_string())?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).map_err(|error| error.to_string())?;
+        let input_worker = event::start_input(
+            self.input_events
+                .take()
+                .ok_or("terminal input is already running")?,
+        );
         let result = (|| -> Result<(), String> {
             while !self.quit {
-                self.receive();
                 if self.dirty {
                     self.draw(&mut terminal)
                         .map_err(|error| error.to_string())?;
                     self.dirty = false;
                 }
-                if event::poll(Duration::from_millis(50)).map_err(|error| error.to_string())? {
-                    match event::read().map_err(|error| error.to_string())? {
-                        Event::Key(key) if key.kind == KeyEventKind::Press => {
-                            self.handle_key(key);
+                match self.events.recv().map_err(|error| error.to_string())? {
+                    UiEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                        if self.handle_key(key) {
                             self.dirty = true;
                         }
-                        Event::Resize(_, _) => self.dirty = true,
-                        _ => {}
                     }
+                    UiEvent::Terminal(Event::Resize(_, _)) => self.dirty = true,
+                    UiEvent::Terminal(_) => {}
+                    UiEvent::OperationCompleted(response) => self.receive(response),
+                    UiEvent::InputError(error) => return Err(error),
                 }
             }
             Ok(())
         })();
-        let _ = self.requests.send(Request::Stop);
-        let _ = self.link_requests.send(LinkRequest::Stop);
+        let _ = self.operations.send(Operation::Stop);
+        drop(input_worker);
         let _ = disable_raw_mode();
         let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
         let _ = terminal.show_cursor();
@@ -815,17 +768,11 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{self, Receiver, Sender};
 
-    fn test_app() -> (
-        App,
-        Receiver<Request>,
-        Sender<Response>,
-        Receiver<LinkRequest>,
-    ) {
-        let (request_tx, request_rx) = mpsc::channel();
-        let (response_tx, response_rx) = mpsc::channel();
-        let (link_request_tx, link_request_rx) = mpsc::channel();
-        let (_link_response_tx, link_response_rx) = mpsc::channel();
+    fn test_app() -> (App, Receiver<Operation>, Sender<UiEvent>) {
+        let (operation_tx, operation_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let app = App {
             graph: None,
             preview: None,
@@ -840,13 +787,9 @@ mod tests {
             status: None,
             status_error: false,
             busy: None,
-            requests: request_tx,
-            responses: response_rx,
-            link_requests: link_request_tx,
-            link_responses: link_response_rx,
-            link_generation: 0,
-            link_status: None,
-            refresh_links_after_load: false,
+            operations: operation_tx,
+            events: event_rx,
+            input_events: None,
             quit: false,
             scroll: 0,
             rendered: Vec::new(),
@@ -854,15 +797,15 @@ mod tests {
             help_open: false,
             dirty: false,
         };
-        (app, request_rx, response_tx, link_request_rx)
+        (app, operation_rx, event_tx)
     }
 
-    fn graph_response() -> Response {
-        Response {
+    fn graph_response() -> OperationResult {
+        OperationResult {
             graph: Ok(Graph::default()),
             preview: None,
             publish_plan: None,
-            published_links: None,
+            pr_links: None,
             operation_error: None,
         }
     }
@@ -936,7 +879,7 @@ mod tests {
 
     #[test]
     fn enter_confirms_move_and_publish_previews() {
-        let (mut move_app, move_requests, _responses, _link_requests) = test_app();
+        let (mut move_app, move_operations, _events) = test_app();
         move_app.pending = Some(MovePlan {
             selected: "selected".into(),
             destination: "destination".into(),
@@ -952,9 +895,12 @@ mod tests {
             commits: vec!["selected".into()],
         });
         move_app.enter();
-        assert!(matches!(move_requests.recv().unwrap(), Request::Apply(_)));
+        assert!(matches!(
+            move_operations.recv().unwrap(),
+            Operation::Apply(_)
+        ));
 
-        let (mut publish_app, publish_requests, _responses, _link_requests) = test_app();
+        let (mut publish_app, publish_operations, _events) = test_app();
         publish_app.publish_plan = Some(SubmitPlan {
             options: SubmitOptions::default(),
             fork: "owner/repo".into(),
@@ -964,24 +910,24 @@ mod tests {
         });
         publish_app.enter();
         assert!(matches!(
-            publish_requests.recv().unwrap(),
-            Request::PublishExecute(_)
+            publish_operations.recv().unwrap(),
+            Operation::PublishExecute(_)
         ));
     }
 
     #[test]
     fn removed_uppercase_and_apply_keys_do_nothing() {
-        let (mut app, requests, _responses, _link_requests) = test_app();
+        let (mut app, operations, _events) = test_app();
         for key in ['a', 'P', 'R'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         assert!(matches!(
-            requests.try_recv(),
+            operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
 
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-        assert!(matches!(requests.recv().unwrap(), Request::Load));
+        assert!(matches!(operations.recv().unwrap(), Operation::Refresh));
     }
 
     #[test]
@@ -1046,55 +992,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_link_generations_are_rejected() {
-        let stale = LinkResponse {
-            generation: 4,
-            result: Ok(BTreeMap::new()),
-        };
-        let current = LinkResponse {
-            generation: 5,
-            result: Ok(BTreeMap::new()),
-        };
-
-        assert!(!current_link_response(5, &stale));
-        assert!(current_link_response(5, &current));
-    }
-
-    #[test]
     fn graph_load_does_not_fetch_pr_links_without_explicit_refresh() {
-        let (mut app, _requests, responses, link_requests) = test_app();
-        responses.send(graph_response()).unwrap();
-
-        app.receive();
-
-        assert!(matches!(
-            link_requests.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
+        let (mut app, _operations, _events) = test_app();
+        app.receive(graph_response());
+        assert!(app.pr_links.is_empty());
     }
 
     #[test]
-    fn explicit_refresh_fetches_pr_links_once_after_loading_the_graph() {
-        let (mut app, requests, responses, link_requests) = test_app();
-
+    fn explicit_refresh_is_one_combined_operation() {
+        let (mut app, operations, _events) = test_app();
         app.refresh();
-        assert!(matches!(requests.recv().unwrap(), Request::Load));
-        responses.send(graph_response()).unwrap();
-        app.receive();
-
+        assert!(matches!(operations.recv().unwrap(), Operation::Refresh));
         assert!(matches!(
-            link_requests.recv().unwrap(),
-            LinkRequest::Load { generation: 1, .. }
-        ));
-        assert!(matches!(
-            link_requests.try_recv(),
+            operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
     }
 
     #[test]
     fn normal_graph_updates_keep_existing_pr_links_without_refetching() {
-        let (mut app, _requests, responses, link_requests) = test_app();
+        let (mut app, operations, _events) = test_app();
         app.pr_links.insert(
             "origin/fs-head/topic/1".into(),
             PullRequestLink {
@@ -1103,72 +1020,120 @@ mod tests {
                 url: "https://example.invalid/1".into(),
             },
         );
-        responses.send(graph_response()).unwrap();
-
-        app.receive();
+        app.receive(graph_response());
 
         assert_eq!(app.pr_links.len(), 1);
         assert!(matches!(
-            link_requests.try_recv(),
+            operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
     }
 
     #[test]
     fn successful_publish_updates_pr_links_without_refetching() {
-        let (mut app, _requests, responses, link_requests) = test_app();
+        let (mut app, operations, _events) = test_app();
         let link = PullRequestLink {
             number: 1,
             head_ref_name: "fs-head/topic/1".into(),
             url: "https://example.invalid/1".into(),
         };
-        responses
-            .send(Response {
-                published_links: Some([("origin/fs-head/topic/1".into(), link.clone())].into()),
-                ..graph_response()
-            })
-            .unwrap();
-
-        app.receive();
+        app.receive(OperationResult {
+            pr_links: Some(Ok([("origin/fs-head/topic/1".into(), link.clone())].into())),
+            ..graph_response()
+        });
 
         assert_eq!(app.pr_links.get("origin/fs-head/topic/1"), Some(&link));
-        assert_eq!(app.link_generation, 1);
         assert!(matches!(
-            link_requests.try_recv(),
+            operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
     }
 
     #[test]
-    fn link_request_payload_contains_only_deduplicated_head_names() {
+    fn navigation_and_help_remain_available_while_an_operation_runs() {
+        let (mut app, _operations, _events) = test_app();
         let graph = Graph {
             commits: [
                 (
                     "a".into(),
                     crate::ui::model::Commit {
-                        remote_refs: vec![
-                            "origin/fs-head/topic/1".into(),
-                            "origin/fs-base/topic/2".into(),
-                        ],
+                        id: "a".into(),
                         ..crate::ui::model::Commit::default()
                     },
                 ),
                 (
                     "b".into(),
                     crate::ui::model::Commit {
-                        remote_refs: vec!["origin/fs-head/topic/1".into()],
+                        id: "b".into(),
                         ..crate::ui::model::Commit::default()
                     },
                 ),
             ]
             .into(),
+            order: vec!["a".into(), "b".into()],
             ..Graph::default()
         };
+        app.graph = Some(graph);
+        app.selected = Some("a".into());
+        app.busy = Some(Busy::Load);
 
-        let LinkRequest::Load { generation, heads } = link_request(9, &graph, "origin") else {
-            panic!("expected a load request");
-        };
-        assert_eq!(generation, 9);
-        assert_eq!(heads, ["fs-head/topic/1"]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.selected.as_deref(), Some("b"));
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.help_open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(app.search.editing);
+    }
+
+    #[test]
+    fn workflow_and_quit_keys_are_rejected_while_an_operation_runs() {
+        for key in [
+            KeyCode::Char('m'),
+            KeyCode::Char('M'),
+            KeyCode::Enter,
+            KeyCode::Char('p'),
+            KeyCode::Char('r'),
+            KeyCode::Char('q'),
+        ] {
+            let (mut app, operations, _events) = test_app();
+            app.busy = Some(Busy::Load);
+            app.selected = Some("selected".into());
+            app.carried = (key == KeyCode::Enter).then(|| "carried".into());
+
+            app.handle_key(KeyEvent::new(key, KeyModifiers::NONE));
+
+            assert_eq!(
+                app.status.as_deref(),
+                Some("another operation is already running")
+            );
+            assert!(app.status_error);
+            assert!(app.pending.is_none());
+            assert!(app.preview.is_none());
+            assert!(!app.quit);
+            assert!(matches!(
+                operations.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_second_operation_is_rejected_with_a_visible_error() {
+        let (mut app, operations, _events) = test_app();
+        assert!(app.start_operation(Operation::Load, Busy::Load, "loading…"));
+
+        app.refresh();
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("another operation is already running")
+        );
+        assert!(app.status_error);
+        assert!(matches!(operations.recv().unwrap(), Operation::Load));
+        assert!(matches!(
+            operations.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
     }
 }
