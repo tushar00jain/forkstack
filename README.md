@@ -79,3 +79,5 @@ cargo test --features integration-tests --test submit_integration
 python3 -m unittest tests/test_fixture_integration.py
 python3 -m unittest tests/test_python_submit_integration.py
 ```
+
+Run the lightweight real-repository benchmark separately with `cargo run --release --example benchmark`.
