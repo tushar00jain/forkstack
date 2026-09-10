@@ -51,6 +51,11 @@ fn preserve_preview_while_navigating(publish_active: bool) -> bool {
     publish_active
 }
 
+fn checkout_branch(graph: &Graph, commit: &str) -> Option<String> {
+    let refs = &graph.commits.get(commit)?.local_refs;
+    (refs.len() == 1).then(|| refs[0].clone())
+}
+
 fn help_transition(open: bool, key: &KeyEvent) -> Option<bool> {
     if open {
         Some(!matches!(key.code, KeyCode::Char('?') | KeyCode::Esc))
@@ -415,8 +420,15 @@ impl App {
                 }
             }
         } else {
+            let branch = self
+                .graph
+                .as_ref()
+                .and_then(|graph| checkout_branch(graph, &selected));
             self.start_operation(
-                Operation::Checkout(selected),
+                Operation::Checkout {
+                    revision: selected,
+                    branch,
+                },
                 Busy::Mutation,
                 "checking out…",
             );
@@ -834,6 +846,37 @@ mod tests {
     fn navigation_preserves_only_publish_previews() {
         assert!(preserve_preview_while_navigating(true));
         assert!(!preserve_preview_while_navigating(false));
+    }
+
+    #[test]
+    fn checkout_uses_a_unique_displayed_local_branch() {
+        let graph = Graph {
+            commits: [
+                (
+                    "one".into(),
+                    crate::ui::model::Commit {
+                        local_refs: vec!["fs-head/topic/1".into()],
+                        ..crate::ui::model::Commit::default()
+                    },
+                ),
+                (
+                    "many".into(),
+                    crate::ui::model::Commit {
+                        local_refs: vec!["main".into(), "fs-head/topic/1".into()],
+                        ..crate::ui::model::Commit::default()
+                    },
+                ),
+            ]
+            .into(),
+            ..Graph::default()
+        };
+
+        assert_eq!(
+            checkout_branch(&graph, "one").as_deref(),
+            Some("fs-head/topic/1")
+        );
+        assert_eq!(checkout_branch(&graph, "many"), None);
+        assert_eq!(checkout_branch(&graph, "missing"), None);
     }
 
     #[test]

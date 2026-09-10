@@ -18,7 +18,10 @@ use crate::ui::model::{Graph, MovePlan};
 pub(crate) enum Operation {
     Load,
     Refresh,
-    Checkout(String),
+    Checkout {
+        revision: String,
+        branch: Option<String>,
+    },
     Apply(MovePlan),
     PublishPreview(SubmitOptions),
     PublishExecute(SubmitPlan),
@@ -132,7 +135,9 @@ fn operation_worker(
                 loaded_graph = Some(graph);
                 None
             }
-            Operation::Checkout(id) => checkout(&repo, &id).err(),
+            Operation::Checkout { revision, branch } => {
+                checkout(&repo, &revision, branch.as_deref()).err()
+            }
             Operation::Apply(plan) => apply_move(&repo, &plan).err(),
             Operation::PublishPreview(publish_options) => {
                 let remote = publish_options.remote.clone();

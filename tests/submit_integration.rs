@@ -616,7 +616,7 @@ fn checkout_lets_git_refuse_a_conflicting_dirty_switch_without_data_loss() {
     git(&fixture.repo, &["switch", "main"]);
     fs::write(fixture.repo.join("base"), "unsaved contents\n").unwrap();
 
-    let error = checkout(&fixture.repo, &target).unwrap_err();
+    let error = checkout(&fixture.repo, &target, Some("checkout-target")).unwrap_err();
     assert!(error.contains("local changes"), "{error}");
     assert_eq!(
         fs::read_to_string(fixture.repo.join("base")).unwrap(),

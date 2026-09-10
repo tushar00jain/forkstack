@@ -249,22 +249,9 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     })
 }
 
-pub fn checkout(repo: &Path, revision: &str) -> Result<(), String> {
-    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
-    let target = repository
-        .revparse_single(revision)
-        .and_then(|object| object.peel_to_commit())
-        .map_err(|error| error.message().to_owned())?
-        .id();
-    let branches: Vec<_> = repository
-        .references_glob("refs/heads/*")
-        .map_err(|error| error.message().to_owned())?
-        .filter_map(Result::ok)
-        .filter(|reference| reference.target() == Some(target))
-        .filter_map(|reference| reference.shorthand().map(str::to_owned))
-        .collect();
-    if branches.len() == 1 {
-        run(repo, &["switch", &branches[0]])?;
+pub fn checkout(repo: &Path, revision: &str, branch: Option<&str>) -> Result<(), String> {
+    if let Some(branch) = branch {
+        run(repo, &["switch", branch])?;
     } else {
         run(repo, &["switch", "--detach", revision])?;
     }
