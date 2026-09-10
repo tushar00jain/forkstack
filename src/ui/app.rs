@@ -1,14 +1,18 @@
 use std::collections::{BTreeMap, HashSet};
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
+use crossterm::cursor::MoveTo;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::execute;
+use crossterm::style::{
+    Attribute as TerminalAttribute, Color as TerminalColor, Colors, Print, SetAttribute, SetColors,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use crossterm::{execute, queue};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
@@ -122,11 +126,12 @@ fn help_lines() -> Vec<Line<'static>> {
     ]
 }
 
-fn hyperlink_symbol(url: &str, text: &str) -> Option<String> {
-    (!url.chars().any(char::is_control)).then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
+fn hyperlink_sequence(url: &str, text: &str) -> Option<String> {
+    (!url.chars().any(char::is_control) && !text.chars().any(char::is_control))
+        .then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
 }
 
-fn apply_hyperlinks(buffer: &mut Buffer, area: Rect, lines: &[RenderedLine]) {
+fn underline_links(buffer: &mut Buffer, area: Rect, lines: &[RenderedLine]) {
     for (row, line) in lines.iter().enumerate() {
         let y = area.y.saturating_add(row as u16);
         if y >= area.bottom() {
@@ -142,15 +147,69 @@ fn apply_hyperlinks(buffer: &mut Buffer, area: Rect, lines: &[RenderedLine]) {
                 buffer[(x + offset as u16, y)]
                     .set_style(Style::default().add_modifier(Modifier::UNDERLINED));
             }
-            let characters: Vec<_> = link.text.chars().take(visible).collect();
-            for (chunk, pair) in characters.chunks(2).enumerate() {
-                let pair: String = pair.iter().collect();
-                if let Some(symbol) = hyperlink_symbol(&link.url, &pair) {
-                    buffer[(x + (chunk * 2) as u16, y)].set_symbol(&symbol);
-                }
-            }
         }
     }
+}
+
+#[derive(Debug)]
+struct TerminalLink {
+    x: u16,
+    y: u16,
+    text: String,
+    url: String,
+    style: Style,
+}
+
+fn write_terminal_links(writer: &mut impl Write, links: &[TerminalLink]) -> io::Result<()> {
+    for link in links {
+        let Some(sequence) = hyperlink_sequence(&link.url, &link.text) else {
+            continue;
+        };
+        let foreground = link.style.fg.unwrap_or(Color::Reset).into();
+        let background = link.style.bg.unwrap_or(Color::Reset).into();
+        queue!(
+            writer,
+            MoveTo(link.x, link.y),
+            SetAttribute(TerminalAttribute::Reset),
+            SetColors(Colors::new(foreground, background))
+        )?;
+        if link.style.add_modifier.contains(Modifier::BOLD) {
+            queue!(writer, SetAttribute(TerminalAttribute::Bold))?;
+        }
+        queue!(
+            writer,
+            SetAttribute(TerminalAttribute::Underlined),
+            Print(sequence),
+            SetAttribute(TerminalAttribute::Reset),
+            SetColors(Colors::new(TerminalColor::Reset, TerminalColor::Reset))
+        )?;
+    }
+    writer.flush()
+}
+
+fn graph_line_style(
+    line: &RenderedLine,
+    selected: Option<&String>,
+    carried_commits: &HashSet<String>,
+) -> Style {
+    let mut style = Style::default();
+    if line.preview {
+        style = style.fg(Color::Cyan);
+    }
+    if line.conflict {
+        style = style.fg(Color::Red).add_modifier(Modifier::BOLD);
+    }
+    if line
+        .commit
+        .as_ref()
+        .is_some_and(|id| carried_commits.contains(id))
+    {
+        style = style.fg(Color::Yellow);
+    }
+    if line.commit.as_ref() == selected {
+        style = style.bg(Color::Rgb(64, 64, 64));
+    }
+    style
 }
 
 pub struct App {
@@ -596,6 +655,7 @@ impl App {
         let carried_commits = self.carried_commits.clone();
         let status_error = self.status_error;
         let help_open = self.help_open;
+        let mut terminal_links = Vec::new();
         terminal.draw(|frame| {
             let [graph_area, message_area, footer_area] = Layout::vertical([
                 Constraint::Min(1),
@@ -622,28 +682,32 @@ impl App {
             let lines: Vec<Line> = visible
                 .iter()
                 .map(|line| {
-                    let mut style = Style::default();
-                    if line.preview {
-                        style = style.fg(Color::Cyan);
-                    }
-                    if line.conflict {
-                        style = style.fg(Color::Red).add_modifier(Modifier::BOLD);
-                    }
-                    if line
-                        .commit
-                        .as_ref()
-                        .is_some_and(|id| carried_commits.contains(id))
-                    {
-                        style = style.fg(Color::Yellow);
-                    }
-                    if line.commit.as_ref() == selected.as_ref() {
-                        style = style.bg(Color::Rgb(64, 64, 64));
-                    }
-                    Line::styled(line.text.clone(), style)
+                    Line::styled(
+                        line.text.clone(),
+                        graph_line_style(line, selected.as_ref(), &carried_commits),
+                    )
                 })
                 .collect();
             frame.render_widget(Paragraph::new(lines).block(Block::default()), graph_area);
-            apply_hyperlinks(frame.buffer_mut(), graph_area, &visible);
+            underline_links(frame.buffer_mut(), graph_area, &visible);
+            for (row, line) in visible.iter().enumerate() {
+                let style = graph_line_style(line, selected.as_ref(), &carried_commits);
+                for link in &line.links {
+                    let x = graph_area.x.saturating_add(link.start as u16);
+                    let y = graph_area.y.saturating_add(row as u16);
+                    if x >= graph_area.right() || y >= graph_area.bottom() {
+                        continue;
+                    }
+                    let visible_width = link.width.min((graph_area.right() - x) as usize);
+                    terminal_links.push(TerminalLink {
+                        x,
+                        y,
+                        text: link.text.chars().take(visible_width).collect(),
+                        url: link.url.clone(),
+                        style,
+                    });
+                }
+            }
 
             let message = if self.search.editing {
                 Line::from(vec![
@@ -682,7 +746,7 @@ impl App {
                 );
             }
         })?;
-        Ok(())
+        write_terminal_links(terminal.backend_mut(), &terminal_links)
     }
 
     pub fn run(mut self) -> Result<(), String> {
@@ -841,14 +905,15 @@ mod tests {
     #[test]
     fn osc_hyperlink_representation_rejects_control_characters() {
         assert_eq!(
-            hyperlink_symbol("https://example.invalid/1", "or"),
-            Some("\x1b]8;;https://example.invalid/1\x07or\x1b]8;;\x07".into())
+            hyperlink_sequence("https://example.invalid/1", "origin/fs-head/topic/1"),
+            Some("\x1b]8;;https://example.invalid/1\x07origin/fs-head/topic/1\x1b]8;;\x07".into())
         );
-        assert!(hyperlink_symbol("https://example.invalid/\x1b", "or").is_none());
+        assert!(hyperlink_sequence("https://example.invalid/\x1b", "origin").is_none());
+        assert!(hyperlink_sequence("https://example.invalid/1", "ori\ngin").is_none());
     }
 
     #[test]
-    fn hyperlink_rendering_underlines_the_existing_cells_and_embeds_osc_8() {
+    fn hyperlink_rendering_underlines_cells_without_embedding_escape_sequences() {
         let area = Rect::new(0, 0, 40, 1);
         let mut buffer = Buffer::empty(area);
         buffer.set_string(0, 0, "xxorigin/fs-head/topic/1", Style::default());
@@ -865,9 +930,9 @@ mod tests {
             }],
         }];
 
-        apply_hyperlinks(&mut buffer, area, &lines);
+        underline_links(&mut buffer, area, &lines);
 
-        assert!(buffer[(2, 0)].symbol().starts_with("\x1b]8;;"));
+        assert_eq!(buffer[(2, 0)].symbol(), "o");
         assert!(
             buffer[(2, 0)]
                 .style()
@@ -879,6 +944,33 @@ mod tests {
                 .style()
                 .add_modifier
                 .contains(Modifier::UNDERLINED)
+        );
+    }
+
+    #[test]
+    fn terminal_hyperlink_wraps_the_whole_ref_once() {
+        let mut output = Vec::new();
+        write_terminal_links(
+            &mut output,
+            &[TerminalLink {
+                x: 2,
+                y: 3,
+                text: "origin/fs-head/topic/1".into(),
+                url: "https://example.invalid/1".into(),
+                style: Style::default(),
+            }],
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(
+            output.contains(
+                "\x1b]8;;https://example.invalid/1\x07origin/fs-head/topic/1\x1b]8;;\x07"
+            )
+        );
+        assert_eq!(
+            output.matches("\x1b]8;;https://example.invalid/1").count(),
+            1
         );
     }
 
