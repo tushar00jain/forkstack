@@ -103,25 +103,37 @@ fn key_line<'a>(bindings: &'a [(&'a str, &'a str)]) -> Line<'a> {
 fn compact_footer() -> Line<'static> {
     key_line(&[
         ("↑/↓", "select"),
-        ("Enter", "open"),
-        ("m/M", "move"),
-        ("a", "apply"),
-        ("p/P", "publish"),
+        ("Enter", "open/confirm"),
         ("?", "help"),
         ("q", "quit"),
     ])
 }
 
+fn help_line(key: &str, label: &str) -> Line<'static> {
+    const KEY_COLUMN_WIDTH: usize = 13;
+    let key_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let padding = KEY_COLUMN_WIDTH.saturating_sub(Line::raw(key).width());
+    Line::from(vec![
+        Span::styled(key.to_owned(), key_style),
+        Span::raw(" ".repeat(padding)),
+        Span::styled(label.to_owned(), Style::default().fg(Color::White)),
+    ])
+}
+
 fn help_lines() -> Vec<Line<'static>> {
     vec![
-        key_line(&[("↑/↓ or j/k", "select previous/next commit")]),
-        key_line(&[("Enter", "checkout commit or preview pending move")]),
-        key_line(&[("m", "move commit"), ("M", "move substack")]),
-        key_line(&[("a", "apply move preview"), ("Esc", "cancel preview")]),
-        key_line(&[("p", "preview publish"), ("P", "execute publish")]),
-        key_line(&[("/", "search"), ("n/N", "next/previous match")]),
-        key_line(&[("r/R", "refresh graph and PR links")]),
-        key_line(&[("? or Esc", "close help"), ("q", "quit")]),
+        help_line("↑/↓, j/k", "select previous/next commit"),
+        help_line("Enter", "checkout or confirm preview"),
+        help_line("m/M", "move commit / substack"),
+        help_line("Esc", "cancel preview or close help"),
+        help_line("p", "preview publish"),
+        help_line("/", "search"),
+        help_line("n/N", "next/previous match"),
+        help_line("r", "refresh graph and PR links"),
+        help_line("?", "open or close help"),
+        help_line("q", "quit"),
     ]
 }
 
@@ -391,6 +403,14 @@ impl App {
         if self.busy.is_some() {
             return;
         }
+        if self.pending.is_some() {
+            self.apply();
+            return;
+        }
+        if self.publish_plan.is_some() {
+            self.execute_publish();
+            return;
+        }
         let Some(selected) = self.selected.clone() else {
             return;
         };
@@ -556,9 +576,7 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char('a'), _) => self.apply(),
             (KeyCode::Char('p'), _) => self.preview_publish(),
-            (KeyCode::Char('P'), _) => self.execute_publish(),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -571,7 +589,7 @@ impl App {
             }
             (KeyCode::Char('N'), _) => self.next_match(true),
             (KeyCode::Char('n'), _) => self.next_match(false),
-            (KeyCode::Char('r' | 'R'), _) => self.refresh(),
+            (KeyCode::Char('r'), _) => self.refresh(),
             (KeyCode::Char('q'), _) if self.busy == Some(Busy::Mutation) => {
                 self.status = Some("a Git operation is still running".into());
                 self.status_error = true;
@@ -891,24 +909,79 @@ mod tests {
     #[test]
     fn footer_is_compact_and_full_key_map_lives_in_help() {
         let footer = compact_footer().to_string();
-        assert!(footer.contains("p/P publish"));
+        assert!(footer.contains("Enter open/confirm"));
         assert!(footer.contains("? help"));
         assert!(footer.contains("q quit"));
+        assert!(!footer.contains("move"));
+        assert!(!footer.contains("publish"));
         assert!(!footer.contains("search"));
 
         let help = help_lines()
             .into_iter()
             .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
+        assert_eq!(help.len(), 10);
         for binding in [
-            "m move commit",
-            "P execute publish",
-            "/ search",
-            "r/R refresh",
+            "m/M          move commit / substack",
+            "p            preview publish",
+            "/            search",
+            "r            refresh graph and PR links",
         ] {
-            assert!(help.contains(binding), "missing {binding} from {help}");
+            assert!(
+                help.iter().any(|line| line == binding),
+                "missing aligned line {binding:?} from {help:?}"
+            );
         }
+    }
+
+    #[test]
+    fn enter_confirms_move_and_publish_previews() {
+        let (mut move_app, move_requests, _responses, _link_requests) = test_app();
+        move_app.pending = Some(MovePlan {
+            selected: "selected".into(),
+            destination: "destination".into(),
+            include_descendants: false,
+            base: "base".into(),
+            source_base: "source-base".into(),
+            carried_count: 1,
+            tip: "tip".into(),
+            tip_commit: "tip-commit".into(),
+            detach_for_rewrite: false,
+            checkout_branch: "branch".into(),
+            ref_updates: Vec::new(),
+            commits: vec!["selected".into()],
+        });
+        move_app.enter();
+        assert!(matches!(move_requests.recv().unwrap(), Request::Apply(_)));
+
+        let (mut publish_app, publish_requests, _responses, _link_requests) = test_app();
+        publish_app.publish_plan = Some(SubmitPlan {
+            options: SubmitOptions::default(),
+            fork: "owner/repo".into(),
+            base_ref: "origin/main".into(),
+            commits: Vec::new(),
+            updates: Vec::new(),
+        });
+        publish_app.enter();
+        assert!(matches!(
+            publish_requests.recv().unwrap(),
+            Request::PublishExecute(_)
+        ));
+    }
+
+    #[test]
+    fn removed_uppercase_and_apply_keys_do_nothing() {
+        let (mut app, requests, _responses, _link_requests) = test_app();
+        for key in ['a', 'P', 'R'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        }
+        assert!(matches!(
+            requests.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(requests.recv().unwrap(), Request::Load));
     }
 
     #[test]
