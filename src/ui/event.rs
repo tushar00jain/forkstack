@@ -25,6 +25,9 @@ pub(crate) enum Operation {
     Apply(MovePlan),
     PublishPreview(SubmitOptions),
     PublishExecute(SubmitPlan),
+    GhStackSubmit {
+        github_repo: String,
+    },
     Stop,
 }
 
@@ -173,6 +176,12 @@ fn operation_worker(
                     Err(error) => Some(error),
                 }
             }
+            Operation::GhStackSubmit { github_repo } => crate::integrations::gh_stack::submit(
+                &crate::integrations::ProcessRunner,
+                &repo,
+                &github_repo,
+            )
+            .err(),
             Operation::Stop => break,
         };
         let graph =

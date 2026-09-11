@@ -38,6 +38,7 @@ forkstack log --no-remotes -n 20
 | `Enter` | Check out, preview a move, or confirm a preview |
 | `m` / `M` | Move one commit / a substack |
 | `p` | Preview a publish |
+| `s` | Preview an upstream `gh stack submit` |
 | `Esc` | Cancel a preview |
 | `/`, `n`, `N` | Search / next / previous |
 | `r` | Refresh graph and PR links |

@@ -119,6 +119,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("m/M", "move commit / substack"),
         help_line("Esc", "cancel preview or close help"),
         help_line("p", "preview publish"),
+        help_line("s", "preview upstream gh stack submit"),
         help_line("/", "search"),
         help_line("n/N", "next/previous match"),
         help_line("r", "refresh graph and PR links"),
@@ -130,6 +131,10 @@ fn help_lines() -> Vec<Line<'static>> {
 fn hyperlink_sequence(url: &str, text: &str) -> Option<String> {
     (!url.chars().any(char::is_control) && !text.chars().any(char::is_control))
         .then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
+}
+
+fn gh_stack_command(github_repo: &str) -> String {
+    format!("GH_REPO={github_repo} gh stack submit --remote upstream --auto")
 }
 
 #[derive(Debug)]
@@ -234,6 +239,7 @@ pub struct App {
     pending: Option<MovePlan>,
     publish_options: SubmitOptions,
     publish_plan: Option<SubmitPlan>,
+    gh_stack_repo: Option<String>,
     search: Search,
     status: Option<String>,
     status_error: bool,
@@ -262,6 +268,7 @@ impl App {
             pending: None,
             publish_options,
             publish_plan: None,
+            gh_stack_repo: None,
             search: Search::default(),
             status: None,
             status_error: false,
@@ -305,6 +312,7 @@ impl App {
 
     fn clear_preview(&mut self, keep_carried: bool) {
         let had_preview = self.preview.take().is_some();
+        let had_gh_stack_preview = self.gh_stack_repo.take().is_some();
         self.pending = None;
         self.publish_plan = None;
         if !keep_carried {
@@ -313,6 +321,11 @@ impl App {
         }
         if had_preview {
             self.update_rendered();
+        }
+        if had_gh_stack_preview {
+            self.status = None;
+            self.status_error = false;
+            self.dirty = true;
         }
     }
 
@@ -392,6 +405,10 @@ impl App {
         }
         if self.publish_plan.is_some() {
             self.execute_publish();
+            return;
+        }
+        if self.gh_stack_repo.is_some() {
+            self.execute_gh_stack_submit();
             return;
         }
         let Some(selected) = self.selected.clone() else {
@@ -483,6 +500,36 @@ impl App {
         );
     }
 
+    fn preview_gh_stack_submit(&mut self) {
+        self.clear_preview(false);
+        match crate::core::submit::github_repository(&self.publish_options.repo, "upstream") {
+            Ok(github_repo) => {
+                self.status = Some(format!(
+                    "{} — press Enter to execute",
+                    gh_stack_command(&github_repo)
+                ));
+                self.status_error = false;
+                self.gh_stack_repo = Some(github_repo);
+            }
+            Err(error) => {
+                self.status = Some(error);
+                self.status_error = true;
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn execute_gh_stack_submit(&mut self) {
+        let Some(github_repo) = self.gh_stack_repo.clone() else {
+            return;
+        };
+        self.start_operation(
+            Operation::GhStackSubmit { github_repo },
+            Busy::Mutation,
+            "submitting upstream stack…",
+        );
+    }
+
     fn update_search(&mut self) {
         let needle = self.search.query.to_lowercase();
         self.search.matches = self
@@ -555,7 +602,7 @@ impl App {
         if self.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'q')
+                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 's' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -570,6 +617,7 @@ impl App {
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
             (KeyCode::Char('p'), _) => self.preview_publish(),
+            (KeyCode::Char('s'), _) => self.preview_gh_stack_submit(),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -604,6 +652,7 @@ impl App {
                     self.carried_commits.clear();
                     self.pending = None;
                     self.publish_plan = None;
+                    self.gh_stack_repo = None;
                 }
                 let ids = self.graph_ids();
                 self.selected = old
@@ -720,7 +769,7 @@ impl App {
             frame.render_widget(Paragraph::new(compact_footer()), footer_area);
 
             if help_open {
-                let area = centered(frame.area(), 62, 12);
+                let area = centered(frame.area(), 62, 13);
                 frame.render_widget(Clear, area);
                 frame.render_widget(
                     Paragraph::new(help_lines()).block(
@@ -795,6 +844,7 @@ mod tests {
             pending: None,
             publish_options: SubmitOptions::default(),
             publish_plan: None,
+            gh_stack_repo: None,
             search: Search::default(),
             status: None,
             status_error: false,
@@ -906,10 +956,11 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 10);
+        assert_eq!(help.len(), 11);
         for binding in [
             "m/M          move commit / substack",
             "p            preview publish",
+            "s            preview upstream gh stack submit",
             "/            search",
             "r            refresh graph and PR links",
         ] {
@@ -921,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_confirms_move_and_publish_previews() {
+    fn enter_confirms_move_publish_and_gh_stack_previews() {
         let (mut move_app, move_operations, _events) = test_app();
         move_app.pending = Some(MovePlan {
             selected: "selected".into(),
@@ -956,6 +1007,23 @@ mod tests {
             publish_operations.recv().unwrap(),
             Operation::PublishExecute(_)
         ));
+
+        let (mut stack_app, stack_operations, _events) = test_app();
+        stack_app.gh_stack_repo = Some("meta-pytorch/torchstore".into());
+        stack_app.enter();
+        assert!(matches!(
+            stack_operations.recv().unwrap(),
+            Operation::GhStackSubmit { github_repo }
+                if github_repo == "meta-pytorch/torchstore"
+        ));
+    }
+
+    #[test]
+    fn gh_stack_preview_displays_the_exact_command() {
+        assert_eq!(
+            gh_stack_command("meta-pytorch/torchstore"),
+            "GH_REPO=meta-pytorch/torchstore gh stack submit --remote upstream --auto"
+        );
     }
 
     #[test]
@@ -1137,6 +1205,7 @@ mod tests {
             KeyCode::Enter,
             KeyCode::Char('p'),
             KeyCode::Char('r'),
+            KeyCode::Char('s'),
             KeyCode::Char('q'),
         ] {
             let (mut app, operations, _events) = test_app();

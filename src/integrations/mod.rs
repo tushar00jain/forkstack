@@ -1,3 +1,4 @@
+pub mod gh_stack;
 pub mod git;
 pub mod github;
 pub mod log;

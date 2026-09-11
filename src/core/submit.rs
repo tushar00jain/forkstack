@@ -945,6 +945,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_github_repository_from_https_and_ssh_remotes() {
+        assert_eq!(
+            parse_owner_repo("https://github.com/meta-pytorch/torchstore.git").as_deref(),
+            Some("meta-pytorch/torchstore")
+        );
+        assert_eq!(
+            parse_owner_repo("git@github.com:meta-pytorch/torchstore.git").as_deref(),
+            Some("meta-pytorch/torchstore")
+        );
+    }
+
+    #[test]
     fn parses_identity_and_removes_it_from_body() {
         let message = "subject\n\nbody\n\nfs-branch: draft/2\n";
         assert_eq!(

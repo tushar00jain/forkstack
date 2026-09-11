@@ -59,6 +59,8 @@ fn is_graph_root_ref(
     remote_base: &str,
     remote_head_prefix: &str,
     remote_base_prefix: &str,
+    upstream_base: &str,
+    upstream_head_prefix: &str,
 ) -> bool {
     name == local_base
         || name.starts_with("refs/heads/fs-head/")
@@ -66,6 +68,8 @@ fn is_graph_root_ref(
         || name == remote_base
         || name.starts_with(remote_head_prefix)
         || name.starts_with(remote_base_prefix)
+        || name == upstream_base
+        || name.starts_with(upstream_head_prefix)
 }
 
 fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
@@ -128,6 +132,8 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     let remote_base = format!("refs/remotes/{remote}/{base}");
     let remote_head_prefix = format!("refs/remotes/{remote}/fs-head/");
     let remote_base_prefix = format!("refs/remotes/{remote}/fs-base/");
+    let upstream_base = format!("refs/remotes/upstream/{base}");
+    let upstream_head_prefix = "refs/remotes/upstream/fs-head/";
     let mut tags = Vec::new();
     for reference in repository
         .references()
@@ -143,6 +149,8 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
             &remote_base,
             &remote_head_prefix,
             &remote_base_prefix,
+            &upstream_base,
+            upstream_head_prefix,
         );
         let is_tag = name.starts_with("refs/tags/");
         if !is_root && !is_tag {
@@ -534,15 +542,19 @@ mod tests {
     #[test]
     fn graph_roots_are_limited_to_forkstack_and_configured_base_refs() {
         let local_base = "refs/heads/trunk";
-        let remote_base = "refs/remotes/upstream/trunk";
-        let remote_head_prefix = "refs/remotes/upstream/fs-head/";
-        let remote_base_prefix = "refs/remotes/upstream/fs-base/";
+        let remote_base = "refs/remotes/origin/trunk";
+        let remote_head_prefix = "refs/remotes/origin/fs-head/";
+        let remote_base_prefix = "refs/remotes/origin/fs-base/";
+        let upstream_base = "refs/remotes/upstream/trunk";
+        let upstream_head_prefix = "refs/remotes/upstream/fs-head/";
         for name in [
             "refs/heads/fs-head/topic/1",
             "refs/heads/fs-base/topic/1",
             "refs/heads/trunk",
+            "refs/remotes/origin/fs-head/topic/1",
+            "refs/remotes/origin/fs-base/topic/1",
+            "refs/remotes/origin/trunk",
             "refs/remotes/upstream/fs-head/topic/1",
-            "refs/remotes/upstream/fs-base/topic/1",
             "refs/remotes/upstream/trunk",
         ] {
             assert!(
@@ -551,14 +563,16 @@ mod tests {
                     local_base,
                     remote_base,
                     remote_head_prefix,
-                    remote_base_prefix
+                    remote_base_prefix,
+                    upstream_base,
+                    upstream_head_prefix,
                 ),
                 "{name}"
             );
         }
         for name in [
             "refs/heads/unrelated",
-            "refs/remotes/origin/trunk",
+            "refs/remotes/upstream/fs-base/topic/1",
             "refs/remotes/upstream/unrelated",
             "refs/tags/v1",
         ] {
@@ -568,7 +582,9 @@ mod tests {
                     local_base,
                     remote_base,
                     remote_head_prefix,
-                    remote_base_prefix
+                    remote_base_prefix,
+                    upstream_base,
+                    upstream_head_prefix,
                 ),
                 "{name}"
             );

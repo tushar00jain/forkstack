@@ -555,6 +555,26 @@ fn graph_does_not_walk_unrelated_branch_history() {
     git(&fixture.repo, &["tag", "unrelated-tag", &unrelated]);
     git(&fixture.repo, &["switch", "main"]);
     git(&fixture.repo, &["tag", "visible-tag", &fixture.first]);
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/upstream/main", &fixture.base],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/remotes/upstream/fs-head/draft/1",
+            &fixture.first,
+        ],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/remotes/upstream/fs-base/ignored",
+            &fixture.second,
+        ],
+    );
 
     let graph = forkstack::ui::git::load_graph_for(&fixture.repo, "origin", "main").unwrap();
     assert!(!graph.commits.contains_key(&unrelated));
@@ -564,6 +584,21 @@ fn graph_does_not_walk_unrelated_branch_history() {
         graph.commits[&fixture.first]
             .tags
             .contains(&"visible-tag".into())
+    );
+    assert!(
+        graph.commits[&fixture.first]
+            .remote_refs
+            .contains(&"upstream/fs-head/draft/1".into())
+    );
+    assert!(
+        graph.commits[&fixture.base]
+            .remote_refs
+            .contains(&"upstream/main".into())
+    );
+    assert!(
+        !graph.commits[&fixture.second]
+            .remote_refs
+            .contains(&"upstream/fs-base/ignored".into())
     );
 }
 
