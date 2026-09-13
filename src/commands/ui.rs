@@ -9,7 +9,7 @@ pub struct UiArgs {
     #[arg(
         long,
         default_value = ".",
-        help = "repository directory (default: cwd)"
+        help = "repository or parent directory to scan one level down (default: cwd)"
     )]
     pub repo: PathBuf,
     #[arg(long, default_value = "origin", help = "remote for your fork")]
@@ -36,6 +36,6 @@ pub fn run(args: UiArgs) -> Result<(), String> {
         base: args.base,
         prefix: args.prefix,
         draft: !args.no_draft,
-    })
+    })?
     .run()
 }

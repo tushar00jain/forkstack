@@ -24,6 +24,9 @@ forkstack submit --prefix feat --execute
 # Open the terminal UI
 forkstack ui --repo . --prefix feat
 
+# Browse repositories in a parent folder (root plus immediate children)
+forkstack ui --repo ..
+
 # View the Git graph
 forkstack log
 forkstack log --remote origin,upstream
@@ -34,16 +37,35 @@ forkstack log --no-remotes -n 20
 
 | Key | Action |
 | --- | --- |
-| `Up` / `Down` | Select |
-| `Enter` | Check out, preview a move, or confirm a preview |
+| `Tab` / `Shift-Tab` | Focus the next / previous pane |
+| `j/k`, `Up` / `Down` | Navigate the focused pane |
+| `Enter` | Activate a repository; in the graph, check out or preview/confirm a move |
 | `m` / `M` | Move one commit / a substack |
 | `p` | Preview a publish |
 | `s` | Preview an upstream `gh stack submit` |
-| `Esc` | Cancel a preview |
-| `/`, `n`, `N` | Search / next / previous |
-| `r` | Refresh graph and PR links |
+| `Esc` | Exit search, clear a repository filter, or cancel a graph preview |
+| `/` | Filter repositories by name/path or search commits in the focused pane |
+| `n`, `N` | Next / previous graph search match |
+| `r` | Rescan repositories; in the graph, also refresh graph and PR links |
 | `?` | Show the complete key map |
 | `q` | Quit |
+
+Opening a parent folder starts in the repository sidebar. Highlighting or filtering
+repositories does not load history: press `Enter` to activate one, then `Tab` to
+focus its graph. Opening a repository directly (including from a subdirectory)
+activates it immediately. A direct single-repository view hides the sidebar;
+narrow terminals show only the focused pane.
+
+Each visited repository retains its graph, selected commit, scroll position, and
+search for the session. Graphs load on activation and PR links refresh only on
+request. While typing a search, `j/k` enter text, arrows navigate matches, and
+`Enter` finishes the search; in the sidebar, press `Enter` again to activate the
+highlighted result. Switching repositories cancels unconfirmed previews and is
+blocked while checkout, rebase, or publishing is running.
+
+Discovery includes Git worktrees (`.git` files), skips invalid repositories and
+child directory symlinks, and does not scan grandchildren. Press `r` in the sidebar
+to discover newly added or removed repositories without loading their graphs.
 
 ### Fixture
 
@@ -77,6 +99,7 @@ Real-system tests are opt-in and run separately:
 
 ```sh
 cargo test --features integration-tests --test submit_integration
+cargo test --features integration-tests --test workspace_integration
 python3 -m unittest tests/test_fixture_integration.py
 python3 -m unittest tests/test_python_submit_integration.py
 ```

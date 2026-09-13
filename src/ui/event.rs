@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -32,7 +33,16 @@ pub(crate) enum Operation {
 }
 
 #[derive(Debug)]
+pub(crate) struct OperationRequest {
+    pub(crate) options: SubmitOptions,
+    pub(crate) id: u64,
+    pub(crate) operation: Operation,
+}
+
+#[derive(Debug)]
 pub(crate) struct OperationResult {
+    pub(crate) repo: PathBuf,
+    pub(crate) id: u64,
     pub(crate) graph: Result<Graph, String>,
     pub(crate) preview: Option<Graph>,
     pub(crate) publish_plan: Option<SubmitPlan>,
@@ -43,21 +53,21 @@ pub(crate) struct OperationResult {
 #[derive(Debug)]
 pub(crate) enum UiEvent {
     Terminal(Event),
-    OperationCompleted(OperationResult),
+    OperationCompleted(Box<OperationResult>),
     InputError(String),
 }
 
 pub(crate) struct EventLoop {
-    pub(crate) operations: Sender<Operation>,
+    pub(crate) operations: Sender<OperationRequest>,
     pub(crate) events: Receiver<UiEvent>,
     pub(crate) input_events: Sender<UiEvent>,
 }
 
-pub(crate) fn start(options: SubmitOptions) -> EventLoop {
+pub(crate) fn start() -> EventLoop {
     let (event_tx, event_rx) = mpsc::channel();
     let (operation_tx, operation_rx) = mpsc::channel();
     let operation_events = event_tx.clone();
-    thread::spawn(move || operation_worker(options, operation_rx, operation_events));
+    thread::spawn(move || operation_worker(operation_rx, operation_events));
     EventLoop {
         operations: operation_tx,
         events: event_rx,
@@ -113,18 +123,15 @@ fn input_worker(events: Sender<UiEvent>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn operation_worker(
-    options: SubmitOptions,
-    operations: Receiver<Operation>,
-    events: Sender<UiEvent>,
-) {
-    let repo = options.repo.clone();
-    while let Ok(operation) = operations.recv() {
+fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEvent>) {
+    while let Ok(request) = operations.recv() {
+        let options = request.options;
+        let repo = options.repo.clone();
         let mut preview = None;
         let mut publish_plan = None;
         let mut pr_links = None;
         let mut loaded_graph = None;
-        let operation_error = match operation {
+        let operation_error = match request.operation {
             Operation::Load => None,
             Operation::Refresh => {
                 let graph = load_graph_for(&repo, &options.remote, &options.base);
@@ -187,13 +194,15 @@ fn operation_worker(
         let graph =
             loaded_graph.unwrap_or_else(|| load_graph_for(&repo, &options.remote, &options.base));
         if events
-            .send(UiEvent::OperationCompleted(OperationResult {
+            .send(UiEvent::OperationCompleted(Box::new(OperationResult {
+                repo,
+                id: request.id,
                 graph,
                 preview,
                 publish_plan,
                 pr_links,
                 operation_error,
-            }))
+            })))
             .is_err()
         {
             break;
@@ -208,13 +217,15 @@ mod tests {
     #[test]
     fn worker_completion_is_a_ui_event() {
         let (events, received) = mpsc::channel();
-        let event = UiEvent::OperationCompleted(OperationResult {
+        let event = UiEvent::OperationCompleted(Box::new(OperationResult {
+            repo: PathBuf::from("."),
+            id: 0,
             graph: Ok(Graph::default()),
             preview: None,
             publish_plan: None,
             pr_links: None,
             operation_error: None,
-        });
+        }));
         events.send(event).unwrap();
         assert!(matches!(
             received.recv().unwrap(),

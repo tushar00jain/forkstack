@@ -94,9 +94,13 @@ fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
 
 pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, String> {
     let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
-    let head_ref = repository
-        .head()
-        .map_err(|error| error.message().to_owned())?;
+    let head_ref = match repository.head() {
+        Ok(head) => head,
+        Err(error) if error.code() == git2::ErrorCode::UnbornBranch => {
+            return Ok(Graph::default());
+        }
+        Err(error) => return Err(error.message().to_owned()),
+    };
     let head_commit = head_ref
         .peel_to_commit()
         .map_err(|error| error.message().to_owned())?;

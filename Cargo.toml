@@ -22,6 +22,11 @@ name = "submit_integration"
 path = "tests/submit_integration.rs"
 required-features = ["integration-tests"]
 
+[[test]]
+name = "workspace_integration"
+path = "tests/workspace_integration.rs"
+required-features = ["integration-tests"]
+
 [profile.dev]
 debug = 0
 incremental = true
