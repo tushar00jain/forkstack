@@ -123,7 +123,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("Enter", "checkout or confirm preview"),
         help_line("m/M", "move commit / substack"),
         help_line("Esc", "exit search/filter, cancel preview/close help"),
-        help_line("a", "preview gh stack add for current branch"),
+        help_line("a", "preview gh stack add for highlighted branch"),
         help_line("p", "preview publish"),
         help_line("s", "preview upstream gh stack submit"),
         help_line("/", "search focused pane"),
@@ -798,11 +798,12 @@ impl App {
 
     fn preview_gh_stack_add(&mut self) {
         self.clear_preview(false);
-        let branch = self
-            .state
-            .graph
-            .as_ref()
-            .and_then(|graph| graph.branch.clone());
+        let branch = self.state.selected.as_deref().and_then(|selected| {
+            self.state
+                .graph
+                .as_ref()
+                .and_then(|graph| checkout_branch(graph, selected))
+        });
         match branch {
             Some(branch) => {
                 self.state.status = Some(format!(
@@ -813,7 +814,7 @@ impl App {
                 self.state.gh_stack_add_branch = Some(branch);
             }
             None => {
-                self.state.status = Some("cannot add detached HEAD to a stack".into());
+                self.state.status = Some("highlight a commit with exactly one local branch".into());
                 self.state.status_error = true;
             }
         }
@@ -1662,7 +1663,7 @@ mod tests {
         assert_eq!(help.len(), 14);
         for binding in [
             "m/M          move commit / substack",
-            "a            preview gh stack add for current branch",
+            "a            preview gh stack add for highlighted branch",
             "p            preview publish",
             "s            preview upstream gh stack submit",
             "/            search focused pane",
@@ -1761,12 +1762,21 @@ mod tests {
     }
 
     #[test]
-    fn add_preview_uses_the_checked_out_branch_from_the_graph() {
+    fn add_preview_uses_the_highlighted_branch_from_the_graph() {
         let (mut app, operations, _events) = test_app();
         app.state.graph = Some(Graph {
-            branch: Some("feature/topic".into()),
+            branch: Some("stack-tip".into()),
+            commits: [(
+                "selected".into(),
+                crate::ui::model::Commit {
+                    local_refs: vec!["feature/topic".into()],
+                    ..crate::ui::model::Commit::default()
+                },
+            )]
+            .into(),
             ..Graph::default()
         });
+        app.state.selected = Some("selected".into());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
 
@@ -1791,7 +1801,7 @@ mod tests {
     }
 
     #[test]
-    fn add_preview_rejects_detached_head() {
+    fn add_preview_requires_one_local_branch_on_the_highlighted_commit() {
         let (mut app, operations, _events) = test_app();
         app.state.graph = Some(Graph::default());
 
@@ -1799,7 +1809,7 @@ mod tests {
 
         assert_eq!(
             app.state.status.as_deref(),
-            Some("cannot add detached HEAD to a stack")
+            Some("highlight a commit with exactly one local branch")
         );
         assert!(app.state.status_error);
         assert!(app.state.gh_stack_add_branch.is_none());
