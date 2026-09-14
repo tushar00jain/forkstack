@@ -3,6 +3,13 @@ use std::path::Path;
 
 use super::CommandRunner;
 
+pub fn add(runner: &dyn CommandRunner, repo: &Path, branch: &str) -> Result<(), String> {
+    let args = ["stack".into(), "add".into(), branch.into()];
+    runner
+        .run("gh", &args, repo, None, &BTreeMap::new())
+        .map(|_| ())
+}
+
 pub fn submit(runner: &dyn CommandRunner, repo: &Path, github_repo: &str) -> Result<(), String> {
     let args = ["stack", "submit", "--remote", "upstream", "--auto"]
         .map(str::to_owned)
@@ -38,6 +45,24 @@ mod tests {
                 .push((program.into(), args.to_vec(), env.clone()));
             Ok(String::new())
         }
+    }
+
+    #[test]
+    fn add_runs_for_the_confirmed_branch() {
+        let runner = Runner::default();
+
+        add(&runner, Path::new("repo"), "feature/topic").unwrap();
+
+        assert_eq!(
+            *runner.calls.lock().unwrap(),
+            [(
+                "gh".into(),
+                ["stack", "add", "feature/topic"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                BTreeMap::new(),
+            )]
+        );
     }
 
     #[test]

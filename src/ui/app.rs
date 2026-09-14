@@ -123,6 +123,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("Enter", "checkout or confirm preview"),
         help_line("m/M", "move commit / substack"),
         help_line("Esc", "exit search/filter, cancel preview/close help"),
+        help_line("a", "preview gh stack add for current branch"),
         help_line("p", "preview publish"),
         help_line("s", "preview upstream gh stack submit"),
         help_line("/", "search focused pane"),
@@ -140,6 +141,10 @@ fn hyperlink_sequence(url: &str, text: &str) -> Option<String> {
 
 fn gh_stack_command(github_repo: &str) -> String {
     format!("GH_REPO={github_repo} gh stack submit --remote upstream --auto")
+}
+
+fn gh_stack_add_command(branch: &str) -> String {
+    format!("gh stack add {branch}")
 }
 
 #[derive(Debug)]
@@ -244,6 +249,7 @@ struct RepositoryState {
     carry_substack: bool,
     pending: Option<MovePlan>,
     publish_plan: Option<SubmitPlan>,
+    gh_stack_add_branch: Option<String>,
     gh_stack_repo: Option<String>,
     search: Search,
     status: Option<String>,
@@ -328,6 +334,7 @@ impl RepositoryState {
                     self.carried_commits.clear();
                     self.pending = None;
                     self.publish_plan = None;
+                    self.gh_stack_add_branch = None;
                     self.gh_stack_repo = None;
                 }
                 let ids = self.graph_ids();
@@ -583,6 +590,7 @@ impl App {
     fn clear_preview(&mut self, keep_carried: bool) {
         self.state.discard_preview = true;
         let had_preview = self.state.preview.take().is_some();
+        let had_gh_stack_add_preview = self.state.gh_stack_add_branch.take().is_some();
         let had_gh_stack_preview = self.state.gh_stack_repo.take().is_some();
         self.state.pending = None;
         self.state.publish_plan = None;
@@ -593,7 +601,7 @@ impl App {
         if had_preview {
             self.update_rendered();
         }
-        if had_gh_stack_preview {
+        if had_gh_stack_add_preview || had_gh_stack_preview {
             self.state.status = None;
             self.state.status_error = false;
             self.dirty = true;
@@ -690,6 +698,10 @@ impl App {
             self.execute_publish();
             return;
         }
+        if self.state.gh_stack_add_branch.is_some() {
+            self.execute_gh_stack_add();
+            return;
+        }
         if self.state.gh_stack_repo.is_some() {
             self.execute_gh_stack_submit();
             return;
@@ -781,6 +793,41 @@ impl App {
             Operation::PublishExecute(plan),
             Busy::Mutation,
             "publishing…",
+        );
+    }
+
+    fn preview_gh_stack_add(&mut self) {
+        self.clear_preview(false);
+        let branch = self
+            .state
+            .graph
+            .as_ref()
+            .and_then(|graph| graph.branch.clone());
+        match branch {
+            Some(branch) => {
+                self.state.status = Some(format!(
+                    "{} — press Enter to execute",
+                    gh_stack_add_command(&branch)
+                ));
+                self.state.status_error = false;
+                self.state.gh_stack_add_branch = Some(branch);
+            }
+            None => {
+                self.state.status = Some("cannot add detached HEAD to a stack".into());
+                self.state.status_error = true;
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn execute_gh_stack_add(&mut self) {
+        let Some(branch) = self.state.gh_stack_add_branch.clone() else {
+            return;
+        };
+        self.start_operation(
+            Operation::GhStackAdd { branch },
+            Busy::Mutation,
+            "adding branch to stack…",
         );
     }
 
@@ -926,7 +973,7 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 's' | 'q')
+                KeyCode::Enter | KeyCode::Char('a' | 'm' | 'M' | 'p' | 'r' | 's' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -940,6 +987,7 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
+            (KeyCode::Char('a'), _) => self.preview_gh_stack_add(),
             (KeyCode::Char('p'), _) => self.preview_publish(),
             (KeyCode::Char('s'), _) => self.preview_gh_stack_submit(),
             (KeyCode::Esc, _) => self.clear_preview(false),
@@ -1204,7 +1252,7 @@ impl App {
         frame.render_widget(Paragraph::new(footer), footer_area);
 
         if help_open {
-            let area = centered(frame.area(), 68, 15);
+            let area = centered(frame.area(), 68, 16);
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(help_lines()).block(
@@ -1611,9 +1659,10 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 13);
+        assert_eq!(help.len(), 14);
         for binding in [
             "m/M          move commit / substack",
+            "a            preview gh stack add for current branch",
             "p            preview publish",
             "s            preview upstream gh stack submit",
             "/            search focused pane",
@@ -1663,6 +1712,14 @@ mod tests {
             Operation::PublishExecute(_)
         ));
 
+        let (mut add_app, add_operations, _events) = test_app();
+        add_app.state.gh_stack_add_branch = Some("feature/topic".into());
+        add_app.enter();
+        assert!(matches!(
+            add_operations.recv().unwrap().operation,
+            Operation::GhStackAdd { branch } if branch == "feature/topic"
+        ));
+
         let (mut stack_app, stack_operations, _events) = test_app();
         stack_app.state.gh_stack_repo = Some("meta-pytorch/torchstore".into());
         stack_app.enter();
@@ -1676,6 +1733,10 @@ mod tests {
     #[test]
     fn gh_stack_preview_displays_the_exact_command() {
         assert_eq!(
+            gh_stack_add_command("feature/topic"),
+            "gh stack add feature/topic"
+        );
+        assert_eq!(
             gh_stack_command("meta-pytorch/torchstore"),
             "GH_REPO=meta-pytorch/torchstore gh stack submit --remote upstream --auto"
         );
@@ -1684,7 +1745,7 @@ mod tests {
     #[test]
     fn removed_uppercase_and_apply_keys_do_nothing() {
         let (mut app, operations, _events) = test_app();
-        for key in ['a', 'P', 'R'] {
+        for key in ['P', 'R'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         assert!(matches!(
@@ -1696,6 +1757,55 @@ mod tests {
         assert!(matches!(
             operations.recv().unwrap().operation,
             Operation::Refresh
+        ));
+    }
+
+    #[test]
+    fn add_preview_uses_the_checked_out_branch_from_the_graph() {
+        let (mut app, operations, _events) = test_app();
+        app.state.graph = Some(Graph {
+            branch: Some("feature/topic".into()),
+            ..Graph::default()
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.state.status.as_deref(),
+            Some("gh stack add feature/topic — press Enter to execute")
+        );
+        assert_eq!(
+            app.state.gh_stack_add_branch.as_deref(),
+            Some("feature/topic")
+        );
+        assert!(matches!(
+            operations.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        app.enter();
+        assert!(matches!(
+            operations.recv().unwrap().operation,
+            Operation::GhStackAdd { branch } if branch == "feature/topic"
+        ));
+    }
+
+    #[test]
+    fn add_preview_rejects_detached_head() {
+        let (mut app, operations, _events) = test_app();
+        app.state.graph = Some(Graph::default());
+
+        app.preview_gh_stack_add();
+
+        assert_eq!(
+            app.state.status.as_deref(),
+            Some("cannot add detached HEAD to a stack")
+        );
+        assert!(app.state.status_error);
+        assert!(app.state.gh_stack_add_branch.is_none());
+        assert!(matches!(
+            operations.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
         ));
     }
 
@@ -1864,6 +1974,7 @@ mod tests {
     #[test]
     fn workflow_and_quit_keys_are_rejected_while_an_operation_runs() {
         for key in [
+            KeyCode::Char('a'),
             KeyCode::Char('m'),
             KeyCode::Char('M'),
             KeyCode::Enter,

@@ -41,6 +41,7 @@ forkstack log --no-remotes -n 20
 | `j/k`, `Up` / `Down` | Navigate the focused pane |
 | `Enter` | Activate a repository; in the graph, check out or preview/confirm a move |
 | `m` / `M` | Move one commit / a substack |
+| `a` | Preview `gh stack add` for the checked-out branch |
 | `p` | Preview a publish |
 | `s` | Preview an upstream `gh stack submit` |
 | `Esc` | Exit search, clear a repository filter, or cancel a graph preview |

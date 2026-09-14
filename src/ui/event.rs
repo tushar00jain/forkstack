@@ -26,6 +26,9 @@ pub(crate) enum Operation {
     Apply(MovePlan),
     PublishPreview(SubmitOptions),
     PublishExecute(SubmitPlan),
+    GhStackAdd {
+        branch: String,
+    },
     GhStackSubmit {
         github_repo: String,
     },
@@ -183,6 +186,12 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
                     Err(error) => Some(error),
                 }
             }
+            Operation::GhStackAdd { branch } => crate::integrations::gh_stack::add(
+                &crate::integrations::ProcessRunner,
+                &repo,
+                &branch,
+            )
+            .err(),
             Operation::GhStackSubmit { github_repo } => crate::integrations::gh_stack::submit(
                 &crate::integrations::ProcessRunner,
                 &repo,
