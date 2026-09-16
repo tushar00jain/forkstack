@@ -386,6 +386,22 @@ impl CommandRunner for FakeRunner {
         }
         assert_eq!(program, "gh");
         let mut state = self.state.lock().unwrap();
+        if args.starts_with(&["stack".into(), "link".into()]) {
+            assert!(input.is_none());
+            assert!(env.contains_key("GH_REPO"));
+            let base_index = args.iter().position(|arg| arg == "--base").unwrap();
+            let branch_start = base_index + 2;
+            let branches = &args[branch_start..];
+            for (index, branch) in branches.iter().enumerate() {
+                state.prs.get_mut(branch).unwrap().base = if index == 0 {
+                    args[base_index + 1].clone()
+                } else {
+                    branches[index - 1].clone()
+                };
+            }
+            state.events.push("gh:link".into());
+            return Ok(String::new());
+        }
         assert_eq!(args.get(1).map(String::as_str), Some("graphql"));
         assert_eq!(args, ["api", "graphql", "--input", "-"]);
         let request: serde_json::Value = serde_json::from_str(input.unwrap()).unwrap();
@@ -928,7 +944,7 @@ fn head_checked_out_in_another_worktree_is_not_overwritten() {
 }
 
 #[test]
-fn wrong_pr_base_fails_before_identity_or_local_ref_mutation() {
+fn existing_pr_with_a_different_base_is_relinked() {
     let fixture = fixture();
     let runner = FakeRunner::default();
     runner.state.lock().unwrap().prs.insert(
@@ -941,16 +957,13 @@ fn wrong_pr_base_fails_before_identity_or_local_ref_mutation() {
             draft: true,
         },
     );
-    let original_head = git(&fixture.repo, &["rev-parse", "HEAD"]);
     let mut submit = plan(options(&fixture.repo)).unwrap();
-    assert!(submit.commits.iter().any(|step| step.identity_added));
+    execute_with(&mut submit, &runner, &mut |_| {}).unwrap();
 
-    let error = execute_with(&mut submit, &runner, &mut |_| {}).unwrap_err();
-
-    assert!(error.contains("targets \"wrong-base\""), "{error}");
-    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"]), original_head);
-    assert!(!ref_exists(&fixture.repo, "refs/heads/fs-head/draft/1"));
-    assert_eq!(runner.state.lock().unwrap().events, ["gh:discover"]);
+    let state = runner.state.lock().unwrap();
+    assert_eq!(state.prs["fs-head/draft/1"].base, "main");
+    assert_eq!(state.prs["fs-head/draft/2"].base, "fs-head/draft/1");
+    assert_eq!(state.events.last().map(String::as_str), Some("gh:link"));
 }
 
 #[test]
@@ -1017,8 +1030,8 @@ fn execute_creates_and_then_restacks_pull_requests() {
         assert_eq!(state.prs.len(), 2);
         let first = &state.prs["fs-head/draft/1"];
         let second = &state.prs["fs-head/draft/2"];
-        assert_eq!(first.base, "fs-base/draft/1");
-        assert_eq!(second.base, "fs-base/draft/2");
+        assert_eq!(first.base, "main");
+        assert_eq!(second.base, "fs-head/draft/1");
         assert_eq!(first.title, "first change");
         assert_eq!(second.title, "second change");
         assert!(first.body.contains("Stack (top to bottom):"));
@@ -1030,7 +1043,7 @@ fn execute_creates_and_then_restacks_pull_requests() {
         assert!(state.pushes[0].contains(&"--force-with-lease".into()));
         assert_eq!(
             state.events,
-            ["gh:discover", "git:push", "gh:create", "gh:edit"]
+            ["gh:discover", "git:push", "gh:create", "gh:edit", "gh:link",]
         );
     }
 
@@ -1089,8 +1102,8 @@ fn execute_creates_and_then_restacks_pull_requests() {
     );
     let state = runner.state.lock().unwrap();
     assert_eq!(state.prs.len(), 2);
-    assert_eq!(state.prs["fs-head/draft/1"].base, "fs-base/draft/1");
-    assert_eq!(state.prs["fs-head/draft/2"].base, "fs-base/draft/2");
+    assert_eq!(state.prs["fs-head/draft/1"].base, "fs-head/draft/2");
+    assert_eq!(state.prs["fs-head/draft/2"].base, "main");
     assert_eq!(state.prs["fs-head/draft/1"].title, "first change");
     assert_eq!(state.prs["fs-head/draft/2"].title, "second change");
     assert!(
@@ -1118,15 +1131,18 @@ fn execute_creates_and_then_restacks_pull_requests() {
     }
     assert!(state.pushes[1].contains(&"--atomic".into()));
     assert!(state.pushes[1].contains(&"--force-with-lease".into()));
-    assert_eq!(&state.events[4..], ["gh:discover", "git:push", "gh:edit"]);
+    assert_eq!(
+        &state.events[5..],
+        ["gh:discover", "git:push", "gh:edit", "gh:link"]
+    );
     drop(state);
 
     let mut unchanged_plan = plan(options).unwrap();
     execute_with(&mut unchanged_plan, &runner, &mut |_| {}).unwrap();
     let state = runner.state.lock().unwrap();
     assert_eq!(
-        &state.events[7..],
-        ["gh:discover", "git:push"],
-        "an unchanged existing stack uses one batched GitHub read and no per-commit GitHub commands"
+        &state.events[9..],
+        ["gh:discover", "git:push", "gh:link"],
+        "an unchanged existing stack uses one batched GitHub read and relinks the stack"
     );
 }

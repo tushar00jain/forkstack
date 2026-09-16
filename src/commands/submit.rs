@@ -26,7 +26,7 @@ pub struct SubmitArgs {
     pub prefix: Option<String>,
     #[arg(long = "no-draft", help = "open PRs ready for review")]
     pub no_draft: bool,
-    #[arg(long, help = "actually push branches and create PRs")]
+    #[arg(long, help = "actually push branches, create PRs, and link the stack")]
     pub execute: bool,
 }
 

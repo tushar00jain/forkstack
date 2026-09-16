@@ -759,22 +759,21 @@ fn execute_with_links(
     report: &mut dyn FnMut(&str),
 ) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
     let heads: Vec<_> = plan.commits.iter().map(StackCommit::head_branch).collect();
+    let bases: Vec<_> = (0..plan.commits.len())
+        .map(|index| {
+            if index == 0 {
+                plan.options.base.clone()
+            } else {
+                heads[index - 1].clone()
+            }
+        })
+        .collect();
     let mut discovery =
         integrations::github::discover_prs(runner, &plan.options.repo, &plan.fork, &heads)?;
     let mut prs = Vec::with_capacity(plan.commits.len());
     let mut was_existing = Vec::with_capacity(plan.commits.len());
     for step in &plan.commits {
         let pr = discovery.by_head.remove(&step.head_branch());
-        if let Some(pr) = pr.as_ref()
-            && pr.base_ref_name != step.base_branch()
-        {
-            return Err(format!(
-                "PR #{} targets {:?}; expected {:?}",
-                pr.number,
-                pr.base_ref_name,
-                step.base_branch()
-            ));
-        }
         was_existing.push(pr.is_some());
         prs.push(pr);
     }
@@ -799,7 +798,6 @@ fn execute_with_links(
         .enumerate()
         .filter(|(index, _)| prs[*index].is_none())
         .collect();
-    let bases: Vec<_> = plan.commits.iter().map(StackCommit::base_branch).collect();
     let create_requests: Vec<_> = missing
         .iter()
         .map(|(index, step)| integrations::github::CreatePullRequest {
@@ -867,6 +865,15 @@ fn execute_with_links(
         })
         .collect();
     integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
+    report("linking pull requests into a GitHub stack");
+    integrations::gh_stack::link(
+        runner,
+        &plan.options.repo,
+        &plan.fork,
+        &plan.options.remote,
+        &plan.options.base,
+        &heads,
+    )?;
     report(&format!(
         "\n{} pull requests in {}.",
         plan.commits.len(),
@@ -937,6 +944,7 @@ pub fn print_plan(plan: &SubmitPlan) {
             step.head_branch()
         );
     }
+    println!("\n  link the pull requests into a GitHub stack");
     println!("\nRe-run with --execute to do it.");
 }
 

@@ -123,9 +123,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("Enter", "checkout or confirm preview"),
         help_line("m/M", "move commit / substack"),
         help_line("Esc", "exit search/filter, cancel preview/close help"),
-        help_line("a", "preview gh stack add for highlighted branch"),
-        help_line("p", "preview publish"),
-        help_line("s", "preview upstream gh stack submit"),
+        help_line("p", "preview publish and stack link"),
         help_line("/", "search focused pane"),
         help_line("n/N", "next/previous match"),
         help_line("r", "rescan; in graph also refresh graph/PRs"),
@@ -137,14 +135,6 @@ fn help_lines() -> Vec<Line<'static>> {
 fn hyperlink_sequence(url: &str, text: &str) -> Option<String> {
     (!url.chars().any(char::is_control) && !text.chars().any(char::is_control))
         .then(|| format!("\x1B]8;;{url}\x07{text}\x1B]8;;\x07"))
-}
-
-fn gh_stack_command(github_repo: &str) -> String {
-    format!("GH_REPO={github_repo} gh stack submit --remote upstream --auto")
-}
-
-fn gh_stack_add_command(branch: &str) -> String {
-    format!("gh stack add {branch}")
 }
 
 #[derive(Debug)]
@@ -249,8 +239,6 @@ struct RepositoryState {
     carry_substack: bool,
     pending: Option<MovePlan>,
     publish_plan: Option<SubmitPlan>,
-    gh_stack_add_branch: Option<String>,
-    gh_stack_repo: Option<String>,
     search: Search,
     status: Option<String>,
     status_error: bool,
@@ -334,8 +322,6 @@ impl RepositoryState {
                     self.carried_commits.clear();
                     self.pending = None;
                     self.publish_plan = None;
-                    self.gh_stack_add_branch = None;
-                    self.gh_stack_repo = None;
                 }
                 let ids = self.graph_ids();
                 self.selected = old
@@ -590,8 +576,6 @@ impl App {
     fn clear_preview(&mut self, keep_carried: bool) {
         self.state.discard_preview = true;
         let had_preview = self.state.preview.take().is_some();
-        let had_gh_stack_add_preview = self.state.gh_stack_add_branch.take().is_some();
-        let had_gh_stack_preview = self.state.gh_stack_repo.take().is_some();
         self.state.pending = None;
         self.state.publish_plan = None;
         if !keep_carried {
@@ -600,11 +584,6 @@ impl App {
         }
         if had_preview {
             self.update_rendered();
-        }
-        if had_gh_stack_add_preview || had_gh_stack_preview {
-            self.state.status = None;
-            self.state.status_error = false;
-            self.dirty = true;
         }
     }
 
@@ -698,14 +677,6 @@ impl App {
             self.execute_publish();
             return;
         }
-        if self.state.gh_stack_add_branch.is_some() {
-            self.execute_gh_stack_add();
-            return;
-        }
-        if self.state.gh_stack_repo.is_some() {
-            self.execute_gh_stack_submit();
-            return;
-        }
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
@@ -792,73 +763,7 @@ impl App {
         self.start_operation(
             Operation::PublishExecute(plan),
             Busy::Mutation,
-            "publishing…",
-        );
-    }
-
-    fn preview_gh_stack_add(&mut self) {
-        self.clear_preview(false);
-        let branch = self.state.selected.as_deref().and_then(|selected| {
-            self.state
-                .graph
-                .as_ref()
-                .and_then(|graph| checkout_branch(graph, selected))
-        });
-        match branch {
-            Some(branch) => {
-                self.state.status = Some(format!(
-                    "{} — press Enter to execute",
-                    gh_stack_add_command(&branch)
-                ));
-                self.state.status_error = false;
-                self.state.gh_stack_add_branch = Some(branch);
-            }
-            None => {
-                self.state.status = Some("highlight a commit with exactly one local branch".into());
-                self.state.status_error = true;
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn execute_gh_stack_add(&mut self) {
-        let Some(branch) = self.state.gh_stack_add_branch.clone() else {
-            return;
-        };
-        self.start_operation(
-            Operation::GhStackAdd { branch },
-            Busy::Mutation,
-            "adding branch to stack…",
-        );
-    }
-
-    fn preview_gh_stack_submit(&mut self) {
-        self.clear_preview(false);
-        match crate::core::submit::github_repository(&self.publish_options.repo, "upstream") {
-            Ok(github_repo) => {
-                self.state.status = Some(format!(
-                    "{} — press Enter to execute",
-                    gh_stack_command(&github_repo)
-                ));
-                self.state.status_error = false;
-                self.state.gh_stack_repo = Some(github_repo);
-            }
-            Err(error) => {
-                self.state.status = Some(error);
-                self.state.status_error = true;
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn execute_gh_stack_submit(&mut self) {
-        let Some(github_repo) = self.state.gh_stack_repo.clone() else {
-            return;
-        };
-        self.start_operation(
-            Operation::GhStackSubmit { github_repo },
-            Busy::Mutation,
-            "submitting upstream stack…",
+            "publishing and linking…",
         );
     }
 
@@ -974,7 +879,7 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('a' | 'm' | 'M' | 'p' | 'r' | 's' | 'q')
+                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -988,9 +893,7 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char('a'), _) => self.preview_gh_stack_add(),
             (KeyCode::Char('p'), _) => self.preview_publish(),
-            (KeyCode::Char('s'), _) => self.preview_gh_stack_submit(),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -1520,13 +1423,11 @@ mod tests {
         app.receive(loaded(&alpha));
         app.state.preview = Some(Graph::default());
         app.state.carried = Some("a".into());
-        app.state.gh_stack_repo = Some("owner/alpha".into());
         key(&mut app, KeyCode::Down);
         key(&mut app, KeyCode::Enter);
         let jupiter = requests.try_recv().unwrap();
         assert!(app.cached[&alpha.options.repo].preview.is_none());
         assert!(app.cached[&alpha.options.repo].carried.is_none());
-        assert!(app.cached[&alpha.options.repo].gh_stack_repo.is_none());
         app.receive(loaded(&jupiter));
         app.state.busy = Some(Busy::Mutation);
         key(&mut app, KeyCode::Up);
@@ -1660,12 +1561,10 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 14);
+        assert_eq!(help.len(), 12);
         for binding in [
             "m/M          move commit / substack",
-            "a            preview gh stack add for highlighted branch",
-            "p            preview publish",
-            "s            preview upstream gh stack submit",
+            "p            preview publish and stack link",
             "/            search focused pane",
             "r            rescan; in graph also refresh graph/PRs",
         ] {
@@ -1677,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_confirms_move_publish_and_gh_stack_previews() {
+    fn enter_confirms_move_and_publish_previews() {
         let (mut move_app, move_operations, _events) = test_app();
         move_app.state.pending = Some(MovePlan {
             selected: "selected".into(),
@@ -1712,41 +1611,12 @@ mod tests {
             publish_operations.recv().unwrap().operation,
             Operation::PublishExecute(_)
         ));
-
-        let (mut add_app, add_operations, _events) = test_app();
-        add_app.state.gh_stack_add_branch = Some("feature/topic".into());
-        add_app.enter();
-        assert!(matches!(
-            add_operations.recv().unwrap().operation,
-            Operation::GhStackAdd { branch } if branch == "feature/topic"
-        ));
-
-        let (mut stack_app, stack_operations, _events) = test_app();
-        stack_app.state.gh_stack_repo = Some("meta-pytorch/torchstore".into());
-        stack_app.enter();
-        assert!(matches!(
-            stack_operations.recv().unwrap().operation,
-            Operation::GhStackSubmit { github_repo }
-                if github_repo == "meta-pytorch/torchstore"
-        ));
     }
 
     #[test]
-    fn gh_stack_preview_displays_the_exact_command() {
-        assert_eq!(
-            gh_stack_add_command("feature/topic"),
-            "gh stack add feature/topic"
-        );
-        assert_eq!(
-            gh_stack_command("meta-pytorch/torchstore"),
-            "GH_REPO=meta-pytorch/torchstore gh stack submit --remote upstream --auto"
-        );
-    }
-
-    #[test]
-    fn removed_uppercase_and_apply_keys_do_nothing() {
+    fn removed_stack_and_uppercase_keys_do_nothing() {
         let (mut app, operations, _events) = test_app();
-        for key in ['P', 'R'] {
+        for key in ['a', 's', 'P', 'R'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         assert!(matches!(
@@ -1758,64 +1628,6 @@ mod tests {
         assert!(matches!(
             operations.recv().unwrap().operation,
             Operation::Refresh
-        ));
-    }
-
-    #[test]
-    fn add_preview_uses_the_highlighted_branch_from_the_graph() {
-        let (mut app, operations, _events) = test_app();
-        app.state.graph = Some(Graph {
-            branch: Some("stack-tip".into()),
-            commits: [(
-                "selected".into(),
-                crate::ui::model::Commit {
-                    local_refs: vec!["feature/topic".into()],
-                    ..crate::ui::model::Commit::default()
-                },
-            )]
-            .into(),
-            ..Graph::default()
-        });
-        app.state.selected = Some("selected".into());
-
-        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-
-        assert_eq!(
-            app.state.status.as_deref(),
-            Some("gh stack add feature/topic — press Enter to execute")
-        );
-        assert_eq!(
-            app.state.gh_stack_add_branch.as_deref(),
-            Some("feature/topic")
-        );
-        assert!(matches!(
-            operations.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
-        ));
-
-        app.enter();
-        assert!(matches!(
-            operations.recv().unwrap().operation,
-            Operation::GhStackAdd { branch } if branch == "feature/topic"
-        ));
-    }
-
-    #[test]
-    fn add_preview_requires_one_local_branch_on_the_highlighted_commit() {
-        let (mut app, operations, _events) = test_app();
-        app.state.graph = Some(Graph::default());
-
-        app.preview_gh_stack_add();
-
-        assert_eq!(
-            app.state.status.as_deref(),
-            Some("highlight a commit with exactly one local branch")
-        );
-        assert!(app.state.status_error);
-        assert!(app.state.gh_stack_add_branch.is_none());
-        assert!(matches!(
-            operations.try_recv(),
-            Err(mpsc::TryRecvError::Empty)
         ));
     }
 
@@ -1984,13 +1796,11 @@ mod tests {
     #[test]
     fn workflow_and_quit_keys_are_rejected_while_an_operation_runs() {
         for key in [
-            KeyCode::Char('a'),
             KeyCode::Char('m'),
             KeyCode::Char('M'),
             KeyCode::Enter,
             KeyCode::Char('p'),
             KeyCode::Char('r'),
-            KeyCode::Char('s'),
             KeyCode::Char('q'),
         ] {
             let (mut app, operations, _events) = test_app();

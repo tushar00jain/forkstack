@@ -3,17 +3,18 @@ use std::path::Path;
 
 use super::CommandRunner;
 
-pub fn add(runner: &dyn CommandRunner, repo: &Path, branch: &str) -> Result<(), String> {
-    let args = ["stack".into(), "add".into(), branch.into()];
-    runner
-        .run("gh", &args, repo, None, &BTreeMap::new())
-        .map(|_| ())
-}
-
-pub fn submit(runner: &dyn CommandRunner, repo: &Path, github_repo: &str) -> Result<(), String> {
-    let args = ["stack", "submit", "--remote", "upstream", "--auto"]
+pub fn link(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    github_repo: &str,
+    remote: &str,
+    base: &str,
+    branches: &[String],
+) -> Result<(), String> {
+    let mut args = ["stack", "link", "--remote", remote, "--base", base]
         .map(str::to_owned)
         .to_vec();
+    args.extend(branches.iter().cloned());
     let env = BTreeMap::from([("GH_REPO".into(), github_repo.to_owned())]);
     runner.run("gh", &args, repo, None, &env).map(|_| ())
 }
@@ -48,37 +49,36 @@ mod tests {
     }
 
     #[test]
-    fn add_runs_for_the_confirmed_branch() {
+    fn link_runs_for_the_published_origin_branches() {
         let runner = Runner::default();
 
-        add(&runner, Path::new("repo"), "feature/topic").unwrap();
+        link(
+            &runner,
+            Path::new("repo"),
+            "owner/repo",
+            "origin",
+            "main",
+            &["fs-head/topic/1".into(), "fs-head/topic/2".into()],
+        )
+        .unwrap();
 
         assert_eq!(
             *runner.calls.lock().unwrap(),
             [(
                 "gh".into(),
-                ["stack", "add", "feature/topic"]
-                    .map(str::to_owned)
-                    .to_vec(),
-                BTreeMap::new(),
-            )]
-        );
-    }
-
-    #[test]
-    fn submit_runs_the_confirmed_non_interactive_upstream_command() {
-        let runner = Runner::default();
-
-        submit(&runner, Path::new("repo"), "meta-pytorch/torchstore").unwrap();
-
-        assert_eq!(
-            *runner.calls.lock().unwrap(),
-            [(
-                "gh".into(),
-                ["stack", "submit", "--remote", "upstream", "--auto"]
-                    .map(str::to_owned)
-                    .to_vec(),
-                BTreeMap::from([("GH_REPO".into(), "meta-pytorch/torchstore".into())]),
+                [
+                    "stack",
+                    "link",
+                    "--remote",
+                    "origin",
+                    "--base",
+                    "main",
+                    "fs-head/topic/1",
+                    "fs-head/topic/2",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                BTreeMap::from([("GH_REPO".into(), "owner/repo".into())]),
             )]
         );
     }

@@ -5,10 +5,12 @@ viewing and rearranging stacks.
 
 ## Install
 
-Install Git, Rust/Cargo, and the GitHub CLI (`gh`), then authenticate with
-`gh auth login`. The paged `log` command also uses `less`.
+Install Git, Rust/Cargo, the GitHub CLI (`gh`), and the `github/gh-stack`
+extension, then authenticate with `gh auth login`. The paged `log` command also
+uses `less`.
 
 ```sh
+gh extension install github/gh-stack
 cargo install --path .
 ```
 
@@ -41,9 +43,7 @@ forkstack log --no-remotes -n 20
 | `j/k`, `Up` / `Down` | Navigate the focused pane |
 | `Enter` | Activate a repository; in the graph, check out or preview/confirm a move |
 | `m` / `M` | Move one commit / a substack |
-| `a` | Preview `gh stack add` for the highlighted branch |
-| `p` | Preview a publish |
-| `s` | Preview an upstream `gh stack submit` |
+| `p` | Preview publishing and linking the stack on `origin` |
 | `Esc` | Exit search, clear a repository filter, or cancel a graph preview |
 | `/` | Filter repositories by name/path or search commits in the focused pane |
 | `n`, `N` | Next / previous graph search match |
@@ -82,8 +82,8 @@ be tested.
 ## Design
 
 Each commit has a stable `fs-branch` identity. Publishing creates paired
-`fs-base/*` and `fs-head/*` refs so every pull request contains one commit, and
-updates the complete ref set atomically.
+`fs-base/*` and `fs-head/*` refs, updates the complete ref set atomically, and
+links the resulting pull requests into a GitHub stack.
 
 The CLI and UI share the same Rust planner and executor. Previews are in-memory;
 completed operations are always reloaded from Git.

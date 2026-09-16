@@ -14,7 +14,7 @@ struct Cli {
 enum Command {
     /// Show a Git graph of stacks and branches.
     Log(LogArgs),
-    /// Push branches and open the pull requests.
+    /// Push branches, open pull requests, and link the stack.
     Submit(SubmitArgs),
     /// Open the interactive stack graph.
     Ui(UiArgs),
