@@ -95,7 +95,8 @@ fn key_line<'a>(bindings: &'a [(&'a str, &'a str)]) -> Line<'a> {
 fn compact_footer() -> Line<'static> {
     key_line(&[
         ("Tab/⇧Tab", "pane"),
-        ("↑/↓", "select"),
+        ("j/k", "select"),
+        ("Esc", "cancel"),
         ("Enter", "open/confirm"),
         ("?", "help"),
         ("q", "quit"),
@@ -117,19 +118,12 @@ fn help_line(key: &str, label: &str) -> Line<'static> {
 
 fn help_lines() -> Vec<Line<'static>> {
     vec![
-        help_line("Tab/⇧Tab", "focus next/previous pane"),
-        help_line("↑/↓, j/k", "navigate focused pane"),
-        help_line("Enter: repos", "activate highlighted repository"),
-        help_line("Enter", "checkout or confirm preview"),
         help_line("m/M", "move commit / substack"),
-        help_line("Esc", "exit search/filter, cancel preview/close help"),
         help_line("p", "preview publish and stack link"),
         help_line("u", "preview upstream publish and stack link"),
         help_line("/", "search focused pane"),
         help_line("n/N", "next/previous match"),
         help_line("r", "rescan; in graph also refresh graph/PRs"),
-        help_line("?", "open or close help"),
-        help_line("q", "quit"),
     ]
 }
 
@@ -1140,7 +1134,8 @@ impl App {
         let footer = if frame.area().width < 80 {
             key_line(&[
                 ("Tab", "pane"),
-                ("/", "search"),
+                ("j/k", "select"),
+                ("Esc", "cancel"),
                 ("Enter", "open"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1148,9 +1143,9 @@ impl App {
         } else if self.pane == Pane::Repositories {
             key_line(&[
                 ("Tab/⇧Tab", "pane"),
-                ("↑/↓", "select"),
+                ("j/k", "select"),
+                ("Esc", "cancel"),
                 ("Enter", "activate"),
-                ("/", "filter"),
                 ("?", "help"),
                 ("q", "quit"),
             ])
@@ -1552,9 +1547,11 @@ mod tests {
     }
 
     #[test]
-    fn footer_is_compact_and_full_key_map_lives_in_help() {
+    fn help_omits_shortcuts_already_shown_in_the_footer() {
         let footer = compact_footer().to_string();
         assert!(footer.contains("Enter open/confirm"));
+        assert!(footer.contains("j/k select"));
+        assert!(footer.contains("Esc cancel"));
         assert!(footer.contains("? help"));
         assert!(footer.contains("q quit"));
         assert!(!footer.contains("move"));
@@ -1565,7 +1562,7 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 13);
+        assert_eq!(help.len(), 6);
         for binding in [
             "m/M          move commit / substack",
             "p            preview publish and stack link",
@@ -1576,6 +1573,12 @@ mod tests {
             assert!(
                 help.iter().any(|line| line == binding),
                 "missing aligned line {binding:?} from {help:?}"
+            );
+        }
+        for duplicate in ["Tab", "↑/↓", "j/k", "Enter", "Esc", "?", "q"] {
+            assert!(
+                help.iter().all(|line| !line.starts_with(duplicate)),
+                "duplicate footer shortcut {duplicate:?} in {help:?}"
             );
         }
     }
