@@ -336,7 +336,11 @@ impl RepositoryState {
         if let Some(result) = response.pr_links {
             match result {
                 Ok(links) => {
-                    self.pr_links = links;
+                    if mutation {
+                        self.pr_links.extend(links);
+                    } else {
+                        self.pr_links = links;
+                    }
                 }
                 Err(error) => {
                     self.pr_links.clear();
@@ -1780,6 +1784,36 @@ mod tests {
             operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn upstream_publish_keeps_existing_origin_pr_links() {
+        let (mut app, _operations, _events) = test_app();
+        app.state.busy = Some(Busy::Mutation);
+        app.state.pr_links.insert(
+            "origin/fs-head/topic/1".into(),
+            PullRequestLink {
+                number: 1,
+                head_ref_name: "fs-head/topic/1".into(),
+                url: "https://example.invalid/origin/1".into(),
+            },
+        );
+        app.receive(OperationResult {
+            pr_links: Some(Ok([(
+                "upstream/fs-head/topic/1".into(),
+                PullRequestLink {
+                    number: 2,
+                    head_ref_name: "fs-head/topic/1".into(),
+                    url: "https://example.invalid/upstream/2".into(),
+                },
+            )]
+            .into())),
+            ..graph_response()
+        });
+
+        assert_eq!(app.state.pr_links.len(), 2);
+        assert_eq!(app.state.pr_links["origin/fs-head/topic/1"].number, 1);
+        assert_eq!(app.state.pr_links["upstream/fs-head/topic/1"].number, 2);
     }
 
     #[test]
