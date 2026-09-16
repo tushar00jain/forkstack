@@ -45,6 +45,24 @@ fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+fn short_branch_name(name: &str) -> String {
+    let (remote, name) = if let Some(name) = name.strip_prefix("origin/") {
+        ("o/", name)
+    } else if let Some(name) = name.strip_prefix("upstream/") {
+        ("u/", name)
+    } else {
+        ("", name)
+    };
+    let name = if let Some(name) = name.strip_prefix("fs-head/") {
+        format!("h/{name}")
+    } else if let Some(name) = name.strip_prefix("fs-base/") {
+        format!("b/{name}")
+    } else {
+        name.to_owned()
+    };
+    format!("{remote}{name}")
+}
+
 fn push_styled(text: &mut String, styles: &mut Vec<StyledRange>, value: &str, kind: TextKind) {
     let start = text.len();
     text.push_str(value);
@@ -75,7 +93,12 @@ fn commit_label_with_styles(
             let mut label_styles = Vec::new();
             push_styled(&mut label, &mut label_styles, "HEAD", TextKind::Head);
             label.push_str(" -> ");
-            push_styled(&mut label, &mut label_styles, branch, TextKind::LocalRef);
+            push_styled(
+                &mut label,
+                &mut label_styles,
+                &short_branch_name(branch),
+                TextKind::LocalRef,
+            );
             labels.push((label, label_styles));
         } else {
             labels.push((
@@ -90,6 +113,7 @@ fn commit_label_with_styles(
     }
     for name in &commit.local_refs {
         if !commit.is_head || Some(name.as_str()) != head_branch {
+            let name = short_branch_name(name);
             labels.push((
                 name.clone(),
                 vec![StyledRange {
@@ -101,6 +125,7 @@ fn commit_label_with_styles(
         }
     }
     labels.extend(commit.remote_refs.iter().map(|name| {
+        let name = short_branch_name(name);
         (
             name.clone(),
             vec![StyledRange {
@@ -219,13 +244,14 @@ pub fn attach_pr_links(
             let Some(pr) = links.get(name) else {
                 continue;
             };
-            let Some(byte_start) = line.text.find(name) else {
+            let display_name = short_branch_name(name);
+            let Some(byte_start) = line.text.find(&display_name) else {
                 continue;
             };
             line.links.push(RenderedLink {
                 start: Line::raw(&line.text[..byte_start]).width(),
-                width: Line::raw(name).width(),
-                text: name.clone(),
+                width: Line::raw(&display_name).width(),
+                text: display_name,
                 url: pr.url.clone(),
             });
         }
@@ -250,6 +276,33 @@ mod tests {
         assert!(label.contains("HEAD -> main"));
         assert!(label.contains("aaa-marker"));
         assert_eq!(label.matches("main").count(), 1);
+    }
+
+    #[test]
+    fn branch_names_are_shortened_only_for_display() {
+        for (name, display) in [
+            ("origin/fs-base/rdma/3", "o/b/rdma/3"),
+            ("origin/fs-head/rdma/3", "o/h/rdma/3"),
+            ("upstream/fs-base/rdma/3", "u/b/rdma/3"),
+            ("upstream/fs-head/rdma/3", "u/h/rdma/3"),
+            ("fs-base/rdma/3", "b/rdma/3"),
+            ("fs-head/rdma/3", "h/rdma/3"),
+            ("topic", "topic"),
+        ] {
+            assert_eq!(short_branch_name(name), display);
+        }
+
+        let commit = Commit {
+            id: "abcdef012345".into(),
+            subject: "subject".into(),
+            local_refs: vec!["fs-head/rdma/3".into()],
+            remote_refs: vec!["origin/fs-base/rdma/3".into()],
+            ..Commit::default()
+        };
+        assert!(commit_label(&commit, None).contains("h/rdma/3"));
+        assert!(commit_label(&commit, None).contains("o/b/rdma/3"));
+        assert_eq!(commit.local_refs, ["fs-head/rdma/3"]);
+        assert_eq!(commit.remote_refs, ["origin/fs-base/rdma/3"]);
     }
 
     #[test]
@@ -284,7 +337,7 @@ mod tests {
                 ("HEAD", TextKind::Head),
                 ("main", TextKind::LocalRef),
                 ("topic", TextKind::LocalRef),
-                ("origin/topic", TextKind::RemoteRef),
+                ("o/topic", TextKind::RemoteRef),
                 ("tag: v1", TextKind::Tag),
             ]
         );
@@ -346,7 +399,7 @@ mod tests {
 
         assert!(rendered[0].text.ends_with(&original));
         assert_eq!(rendered[0].links.len(), 1);
-        assert_eq!(rendered[0].links[0].text, "origin/fs-head/topic/1");
+        assert_eq!(rendered[0].links[0].text, "o/h/topic/1");
         assert_eq!(rendered[0].links[0].url, "https://example.invalid/9");
     }
 }
