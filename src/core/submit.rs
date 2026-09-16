@@ -669,7 +669,7 @@ pub fn execute_checked_with_links(
 ) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
     let fresh = prepare(expected.options.clone(), Some(expected))?;
     if &fresh != expected {
-        return Err("publish plan changed after fetch; press p to preview the fresh plan".into());
+        return Err("publish plan changed after fetch; preview the fresh plan again".into());
     }
     execute_silent_with_links(fresh)
 }

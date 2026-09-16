@@ -124,6 +124,8 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
     while let Ok(request) = operations.recv() {
         let options = request.options;
         let repo = options.repo.clone();
+        let mut reload_remote = options.remote.clone();
+        let mut reload_base = options.base.clone();
         let mut preview = None;
         let mut publish_plan = None;
         let mut pr_links = None;
@@ -172,6 +174,8 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
                 }
             }
             Operation::PublishExecute(plan) => {
+                reload_remote = plan.options.remote.clone();
+                reload_base = plan.options.base.clone();
                 match crate::core::submit::execute_checked_with_links(&plan) {
                     Ok(links) => {
                         pr_links = Some(Ok(remote_pr_links(&plan.options.remote, links)));
@@ -183,7 +187,7 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
             Operation::Stop => break,
         };
         let graph =
-            loaded_graph.unwrap_or_else(|| load_graph_for(&repo, &options.remote, &options.base));
+            loaded_graph.unwrap_or_else(|| load_graph_for(&repo, &reload_remote, &reload_base));
         if events
             .send(UiEvent::OperationCompleted(Box::new(OperationResult {
                 repo,

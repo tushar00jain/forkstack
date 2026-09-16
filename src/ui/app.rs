@@ -124,6 +124,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("m/M", "move commit / substack"),
         help_line("Esc", "exit search/filter, cancel preview/close help"),
         help_line("p", "preview publish and stack link"),
+        help_line("u", "preview upstream publish and stack link"),
         help_line("/", "search focused pane"),
         help_line("n/N", "next/previous match"),
         help_line("r", "rescan; in graph also refresh graph/PRs"),
@@ -737,10 +738,12 @@ impl App {
         self.start_operation(Operation::Refresh, Busy::Load, "refreshing…");
     }
 
-    fn preview_publish(&mut self) {
+    fn preview_publish(&mut self, remote: String) {
+        let mut options = self.publish_options.clone();
+        options.remote = remote;
         if self.state.busy.is_some() {
             self.start_operation(
-                Operation::PublishPreview(self.publish_options.clone()),
+                Operation::PublishPreview(options),
                 Busy::Load,
                 "planning publish…",
             );
@@ -748,7 +751,7 @@ impl App {
         }
         self.clear_preview(false);
         self.start_operation(
-            Operation::PublishPreview(self.publish_options.clone()),
+            Operation::PublishPreview(options),
             Busy::Load,
             "planning publish…",
         );
@@ -756,7 +759,7 @@ impl App {
 
     fn execute_publish(&mut self) {
         let Some(plan) = self.state.publish_plan.clone() else {
-            self.state.status = Some("press p to preview publish changes first".into());
+            self.state.status = Some("press p or u to preview publish changes first".into());
             self.state.status_error = true;
             return;
         };
@@ -879,7 +882,7 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'q')
+                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'u' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -893,7 +896,8 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char('p'), _) => self.preview_publish(),
+            (KeyCode::Char('p'), _) => self.preview_publish(self.publish_options.remote.clone()),
+            (KeyCode::Char('u'), _) => self.preview_publish("upstream".into()),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
                 self.clear_preview(true);
@@ -1561,10 +1565,11 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 12);
+        assert_eq!(help.len(), 13);
         for binding in [
             "m/M          move commit / substack",
             "p            preview publish and stack link",
+            "u            preview upstream publish and stack link",
             "/            search focused pane",
             "r            rescan; in graph also refresh graph/PRs",
         ] {
@@ -1573,6 +1578,24 @@ mod tests {
                 "missing aligned line {binding:?} from {help:?}"
             );
         }
+    }
+
+    #[test]
+    fn publish_keys_select_the_configured_and_upstream_remotes() {
+        let (mut origin_app, origin_operations, _events) = test_app();
+        origin_app.publish_options.remote = "origin".into();
+        origin_app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(matches!(
+            origin_operations.recv().unwrap().operation,
+            Operation::PublishPreview(options) if options.remote == "origin"
+        ));
+
+        let (mut upstream_app, upstream_operations, _events) = test_app();
+        upstream_app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(
+            upstream_operations.recv().unwrap().operation,
+            Operation::PublishPreview(options) if options.remote == "upstream"
+        ));
     }
 
     #[test]
@@ -1801,6 +1824,7 @@ mod tests {
             KeyCode::Enter,
             KeyCode::Char('p'),
             KeyCode::Char('r'),
+            KeyCode::Char('u'),
             KeyCode::Char('q'),
         ] {
             let (mut app, operations, _events) = test_app();

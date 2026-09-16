@@ -44,6 +44,7 @@ forkstack log --no-remotes -n 20
 | `Enter` | Activate a repository; in the graph, check out or preview/confirm a move |
 | `m` / `M` | Move one commit / a substack |
 | `p` | Preview publishing and linking the stack on `origin` |
+| `u` | Preview publishing and linking the stack on `upstream` |
 | `Esc` | Exit search, clear a repository filter, or cancel a graph preview |
 | `/` | Filter repositories by name/path or search commits in the focused pane |
 | `n`, `N` | Next / previous graph search match |
