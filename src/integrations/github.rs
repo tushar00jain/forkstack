@@ -13,7 +13,6 @@ pub struct PullRequest {
     pub number: u64,
     pub base_ref_name: String,
     pub head_ref_name: String,
-    pub title: String,
     pub body: String,
     pub is_draft: bool,
     pub url: String,
@@ -45,7 +44,6 @@ pub struct CreatePullRequest<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditPullRequest<'a> {
     pub id: &'a str,
-    pub title: &'a str,
     pub body: &'a str,
 }
 
@@ -192,7 +190,7 @@ pub fn discover_prs(
         fork,
         branches,
         "id",
-        "id number baseRefName headRefName title body isDraft url",
+        "id number baseRefName headRefName body isDraft url",
     )?;
     let mut by_head = BTreeMap::new();
     for (index, branch) in branches.iter().enumerate() {
@@ -257,7 +255,7 @@ pub fn create_prs(
         .enumerate()
         .map(|(index, request)| {
             format!(
-                "p{index}:createPullRequest(input:{{repositoryId:{},baseRefName:{},headRefName:{},title:{},body:{},draft:{}}}){{pullRequest{{id number baseRefName headRefName title body isDraft url}}}}",
+                "p{index}:createPullRequest(input:{{repositoryId:{},baseRefName:{},headRefName:{},title:{},body:{},draft:{}}}){{pullRequest{{id number baseRefName headRefName body isDraft url}}}}",
                 graphql_string(repository_id),
                 graphql_string(request.base),
                 graphql_string(request.head),
@@ -294,9 +292,8 @@ pub fn edit_prs(
         .enumerate()
         .map(|(index, request)| {
             format!(
-                "p{index}:updatePullRequest(input:{{pullRequestId:{},title:{},body:{}}}){{pullRequest{{id number baseRefName headRefName title body isDraft url}}}}",
+                "p{index}:updatePullRequest(input:{{pullRequestId:{},body:{}}}){{pullRequest{{id number baseRefName headRefName body isDraft url}}}}",
                 graphql_string(request.id),
-                graphql_string(request.title),
                 graphql_string(request.body),
             )
         })
@@ -429,6 +426,39 @@ mod tests {
     }
 
     #[test]
+    fn edit_updates_only_the_pull_request_body() {
+        let runner = Runner {
+            output: serde_json::json!({
+                "data": {"p0": {"pullRequest": {
+                    "id": "PR_one", "number": 1,
+                    "baseRefName": "main", "headRefName": "topic",
+                    "title": "manual title", "body": "new body",
+                    "isDraft": true, "url": "https://example.invalid/1"
+                }}}
+            })
+            .to_string(),
+            calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        };
+
+        edit_prs(
+            &runner,
+            Path::new("."),
+            &[EditPullRequest {
+                id: "PR_one",
+                body: "new body",
+            }],
+        )
+        .unwrap();
+
+        let input = runner.inputs.lock().unwrap()[0].clone();
+        let request: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let query = request["query"].as_str().unwrap();
+        assert!(query.contains("pullRequestId:\"PR_one\",body:\"new body\""));
+        assert!(!query.contains("title"));
+    }
+
+    #[test]
     fn edit_requires_every_requested_alias() {
         let runner = Runner {
             output: serde_json::json!({"data": {}}).to_string(),
@@ -440,7 +470,6 @@ mod tests {
             Path::new("."),
             &[EditPullRequest {
                 id: "PR_one",
-                title: "title",
                 body: "body",
             }],
         )
@@ -464,7 +493,6 @@ mod tests {
             Path::new("."),
             &[EditPullRequest {
                 id: "PR_one",
-                title: "title",
                 body: "body",
             }],
         )

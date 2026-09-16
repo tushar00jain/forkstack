@@ -446,7 +446,6 @@ impl CommandRunner for FakeRunner {
         } else if query.contains("updatePullRequest") {
             state.events.push("gh:edit".into());
             let ids = graphql_values(&query, "pullRequestId:");
-            let titles = graphql_values(&query, "title:");
             let bodies = graphql_values(&query, "body:");
             let mut data = serde_json::Map::new();
             for index in 0..ids.len() {
@@ -455,7 +454,6 @@ impl CommandRunner for FakeRunner {
                     .iter_mut()
                     .find(|(_, pr)| format!("PR_{}", pr.number) == ids[index])
                     .unwrap();
-                pr.title = titles[index].clone();
                 pr.body = bodies[index].clone();
                 data.insert(
                     format!("p{index}"),
@@ -952,8 +950,8 @@ fn existing_pr_with_a_different_base_is_relinked() {
         FakePr {
             number: 101,
             base: "wrong-base".into(),
-            title: "first change".into(),
-            body: String::new(),
+            title: "manually edited title".into(),
+            body: "manual description".into(),
             draft: true,
         },
     );
@@ -963,6 +961,12 @@ fn existing_pr_with_a_different_base_is_relinked() {
     let state = runner.state.lock().unwrap();
     assert_eq!(state.prs["fs-head/draft/1"].base, "main");
     assert_eq!(state.prs["fs-head/draft/2"].base, "fs-head/draft/1");
+    assert_eq!(state.prs["fs-head/draft/1"].title, "manually edited title");
+    assert!(
+        state.prs["fs-head/draft/1"]
+            .body
+            .starts_with("manual description\n\n<!-- forkstack:stack:start -->")
+    );
     assert_eq!(state.events.last().map(String::as_str), Some("gh:link"));
 }
 

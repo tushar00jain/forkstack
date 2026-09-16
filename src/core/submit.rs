@@ -6,6 +6,8 @@ use git2::{Oid, Repository, Sort};
 use crate::integrations::{self, CommandRunner, ProcessRunner};
 
 pub const IDENTITY_TRAILER: &str = "fs-branch";
+const STACK_SECTION_START: &str = "<!-- forkstack:stack:start -->";
+const STACK_SECTION_END: &str = "<!-- forkstack:stack:end -->";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmitOptions {
@@ -660,6 +662,33 @@ pub fn stack_table(entries: &[(String, Option<u64>, String)], current: &str) -> 
     lines.join("\n")
 }
 
+fn stack_section(entries: &[(String, Option<u64>, String)], current: &str) -> String {
+    format!(
+        "{STACK_SECTION_START}{}{STACK_SECTION_END}",
+        stack_table(entries, current)
+    )
+}
+
+fn update_stack_section(body: &str, section: &str) -> String {
+    if let Some(start) = body.find(STACK_SECTION_START) {
+        let after_start = start + STACK_SECTION_START.len();
+        if let Some(relative_end) = body[after_start..].find(STACK_SECTION_END) {
+            let end = after_start + relative_end + STACK_SECTION_END.len();
+            return format!("{}{}{}", &body[..start], section, &body[end..]);
+        }
+    }
+
+    if body.is_empty() {
+        section.to_owned()
+    } else if body.ends_with("\n\n") {
+        format!("{body}{section}")
+    } else if body.ends_with('\n') {
+        format!("{body}\n{section}")
+    } else {
+        format!("{body}\n\n{section}")
+    }
+}
+
 pub fn execute_checked(expected: &SubmitPlan) -> Result<(), String> {
     execute_checked_with_links(expected).map(|_| ())
 }
@@ -847,21 +876,24 @@ fn execute_with_links(
     let desired_bodies: Vec<_> = plan
         .commits
         .iter()
-        .map(|step| format!("{}{}", stack_table(&entries, &step.branch), step.body))
+        .enumerate()
+        .map(|(index, step)| {
+            update_stack_section(
+                &prs[index].as_ref().unwrap().body,
+                &stack_section(&entries, &step.branch),
+            )
+        })
         .collect();
     let edits: Vec<_> = plan
         .commits
         .iter()
         .enumerate()
-        .filter_map(|(index, step)| {
+        .filter_map(|(index, _)| {
             let pr = prs[index].as_ref()?;
-            (pr.title != step.subject || pr.body != desired_bodies[index]).then_some(
-                integrations::github::EditPullRequest {
-                    id: &pr.id,
-                    title: &step.subject,
-                    body: &desired_bodies[index],
-                },
-            )
+            (pr.body != desired_bodies[index]).then_some(integrations::github::EditPullRequest {
+                id: &pr.id,
+                body: &desired_bodies[index],
+            })
         })
         .collect();
     integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
@@ -1002,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn stack_table_matches_python_layout() {
+    fn stack_table_lists_the_top_commit_first() {
         let entries = vec![
             ("a/1".into(), Some(10), "one".into()),
             ("a/2".into(), Some(11), "two".into()),
@@ -1012,6 +1044,23 @@ mod tests {
             stack_table(&entries, "a/1").find("#11").unwrap()
                 < stack_table(&entries, "a/1").find("#10").unwrap()
         );
+    }
+
+    #[test]
+    fn stack_section_preserves_unmanaged_pr_content() {
+        let entries = vec![("a/1".into(), Some(10), "one".into())];
+        let first = stack_section(&entries, "a/1");
+        let body = update_stack_section("manual description", &first);
+        assert!(body.starts_with("manual description\n\n"));
+        assert!(body.contains(STACK_SECTION_START));
+        assert!(body.contains("- -> #10 one"));
+
+        let changed = stack_section(&[("a/1".into(), Some(11), "new".into())], "a/1");
+        let updated = update_stack_section(&body, &changed);
+        assert!(updated.starts_with("manual description\n\n"));
+        assert!(updated.contains("- -> #11 new"));
+        assert!(!updated.contains("#10"));
+        assert_eq!(updated.matches(STACK_SECTION_START).count(), 1);
     }
 
     #[test]
