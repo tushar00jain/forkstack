@@ -92,6 +92,20 @@ fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
     Ok(paths.into_iter().collect())
 }
 
+fn conflict_marker_names(state: RepositoryState) -> &'static [(&'static str, &'static str)] {
+    match state {
+        RepositoryState::Rebase
+        | RepositoryState::RebaseInteractive
+        | RepositoryState::RebaseMerge
+        | RepositoryState::ApplyMailboxOrRebase => &[("rebase", "REBASE_HEAD")],
+        RepositoryState::Merge => &[("merge", "MERGE_HEAD")],
+        RepositoryState::CherryPick | RepositoryState::CherryPickSequence => {
+            &[("cherry-pick", "CHERRY_PICK_HEAD")]
+        }
+        _ => &[],
+    }
+}
+
 pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, String> {
     let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
     let head_ref = match repository.head() {
@@ -111,12 +125,10 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
         .and_then(|name| name.strip_prefix("refs/heads/"))
         .map(str::to_owned);
 
-    let marker_names = [
-        ("rebase", "REBASE_HEAD"),
-        ("merge", "MERGE_HEAD"),
-        ("cherry-pick", "CHERRY_PICK_HEAD"),
-    ];
-    let markers: Vec<(String, String)> = marker_names
+    // REBASE_HEAD can survive a completed rebase as a historical pseudo-ref.
+    // Only operation markers matching libgit2's current repository state imply
+    // that a conflict is still in progress.
+    let markers: Vec<(String, String)> = conflict_marker_names(repository.state())
         .iter()
         .filter_map(|(kind, name)| {
             fs::read_to_string(repository.path().join(name))
@@ -603,6 +615,41 @@ mod tests {
             "incoming, conflict (rebase: src/lib.rs)"
         );
         assert_eq!(conflict_label(&[], &[]), None);
+    }
+
+    #[test]
+    fn clean_repository_ignores_a_stale_rebase_head() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "forkstack-stale-rebase-head-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap();
+
+        let repository = Repository::init(&path).unwrap();
+        let mut index = repository.index().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repository.find_tree(tree_id).unwrap();
+        let signature = git2::Signature::now("Forkstack Test", "test@example.com").unwrap();
+        let commit = repository
+            .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+            .unwrap();
+        fs::write(repository.path().join("REBASE_HEAD"), commit.to_string()).unwrap();
+        assert_eq!(repository.state(), RepositoryState::Clean);
+        drop(tree);
+        drop(repository);
+
+        let graph = load_graph(&path).unwrap();
+        assert!(
+            graph
+                .commits
+                .values()
+                .all(|commit| commit.conflict.is_none())
+        );
+        fs::remove_dir_all(path).unwrap();
     }
 
     #[test]

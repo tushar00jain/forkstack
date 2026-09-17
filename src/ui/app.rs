@@ -123,7 +123,7 @@ fn help_lines() -> Vec<Line<'static>> {
         help_line("u", "preview upstream publish and stack link"),
         help_line("/", "search focused pane"),
         help_line("n/N", "next/previous match"),
-        help_line("r", "rescan; in graph also refresh graph/PRs"),
+        help_line("r", "rescan and refresh active graph/PRs"),
     ]
 }
 
@@ -510,6 +510,12 @@ impl App {
         }
     }
 
+    fn rescan_and_refresh(&mut self) {
+        if self.rescan() && self.active.is_some() {
+            self.refresh();
+        }
+    }
+
     fn handle_repository_key(&mut self, key: KeyEvent) -> bool {
         if self.repository_search.editing {
             match key.code {
@@ -556,7 +562,7 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                self.rescan();
+                self.rescan_and_refresh();
             }
             _ => return false,
         }
@@ -909,9 +915,7 @@ impl App {
             (KeyCode::Char('N'), _) => self.next_match(true),
             (KeyCode::Char('n'), _) => self.next_match(false),
             (KeyCode::Char('r'), _) => {
-                if self.rescan() && self.active.is_some() {
-                    self.refresh();
-                }
+                self.rescan_and_refresh();
             }
             (KeyCode::Char('q'), _) => self.quit = true,
             _ => return false,
@@ -1572,7 +1576,7 @@ mod tests {
             "p            preview publish and stack link",
             "u            preview upstream publish and stack link",
             "/            search focused pane",
-            "r            rescan; in graph also refresh graph/PRs",
+            "r            rescan and refresh active graph/PRs",
         ] {
             assert!(
                 help.iter().any(|line| line == binding),
@@ -1737,6 +1741,50 @@ mod tests {
             operations.recv().unwrap().operation,
             Operation::Refresh
         ));
+        assert!(matches!(
+            operations.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn repository_pane_refresh_clears_a_stale_conflict() {
+        let (mut app, operations, _events) = test_app();
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        app.workspace.root = root.clone();
+        app.workspace.repositories = vec![root.clone()];
+        app.active = Some(root.clone());
+        app.publish_options.repo = root.clone();
+        app.pane = Pane::Repositories;
+        app.state.graph = Some(Graph {
+            commits: [(
+                "a".into(),
+                crate::ui::model::Commit {
+                    id: "a".into(),
+                    conflict: Some("local (conflict in progress)".into()),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            order: vec!["a".into()],
+            ..Default::default()
+        });
+
+        key(&mut app, KeyCode::Char('r'));
+
+        let request = operations.recv().unwrap();
+        assert!(matches!(request.operation, Operation::Refresh));
+        assert_eq!(request.options.repo, root);
+        app.receive(loaded(&request));
+        assert!(
+            app.state
+                .active_graph()
+                .unwrap()
+                .commits
+                .values()
+                .all(|commit| commit.conflict.is_none())
+        );
         assert!(matches!(
             operations.try_recv(),
             Err(mpsc::TryRecvError::Empty)
