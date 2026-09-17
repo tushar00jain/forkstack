@@ -332,6 +332,7 @@ struct FakePr {
 #[derive(Default)]
 struct FakeState {
     prs: BTreeMap<String, FakePr>,
+    stack: Option<(u64, Vec<u64>)>,
     pushes: Vec<Vec<String>>,
     events: Vec<String>,
 }
@@ -386,6 +387,30 @@ impl CommandRunner for FakeRunner {
         }
         assert_eq!(program, "gh");
         let mut state = self.state.lock().unwrap();
+        if args.first().map(String::as_str) == Some("api")
+            && args
+                .get(1)
+                .is_some_and(|arg| arg.contains("/stacks?pull_request="))
+        {
+            assert!(input.is_none());
+            assert!(env.contains_key("GH_REPO"));
+            let pull_request = args[1].rsplit_once('=').unwrap().1.parse::<u64>().unwrap();
+            return Ok(match &state.stack {
+                Some((number, pull_requests)) if pull_requests.contains(&pull_request) => json!([{
+                    "number": number,
+                    "pull_requests": pull_requests,
+                }])
+                .to_string(),
+                _ => "[]".into(),
+            });
+        }
+        if args.starts_with(&["stack".into(), "unstack".into()]) {
+            assert!(input.is_none());
+            assert!(env.contains_key("GH_REPO"));
+            state.stack = None;
+            state.events.push("gh:unstack".into());
+            return Ok(String::new());
+        }
         if args.starts_with(&["stack".into(), "link".into()]) {
             assert!(input.is_none());
             assert!(env.contains_key("GH_REPO"));
@@ -399,6 +424,13 @@ impl CommandRunner for FakeRunner {
                     branches[index - 1].clone()
                 };
             }
+            state.stack = Some((
+                7,
+                branches
+                    .iter()
+                    .map(|branch| state.prs[branch].number)
+                    .collect(),
+            ));
             state.events.push("gh:link".into());
             return Ok(String::new());
         }
@@ -1148,5 +1180,37 @@ fn execute_creates_and_then_restacks_pull_requests() {
         &state.events[9..],
         ["gh:discover", "git:push", "gh:link"],
         "an unchanged existing stack uses one batched GitHub read and relinks the stack"
+    );
+}
+
+#[test]
+fn removed_layer_is_unstacked_before_the_remaining_prs_are_relinked() {
+    let fixture = fixture();
+    let runner = FakeRunner::default();
+    let options = options(&fixture.repo);
+
+    let mut initial = plan(options.clone()).unwrap();
+    execute_with(&mut initial, &runner, &mut |_| {}).unwrap();
+    {
+        let mut state = runner.state.lock().unwrap();
+        state.stack.as_mut().unwrap().1.insert(1, 999);
+        state.events.clear();
+    }
+
+    let mut updated = plan(options).unwrap();
+    execute_with(&mut updated, &runner, &mut |_| {}).unwrap();
+
+    let state = runner.state.lock().unwrap();
+    assert_eq!(
+        state.events,
+        ["gh:discover", "git:push", "gh:unstack", "gh:link"]
+    );
+    assert_eq!(
+        state.stack.as_ref().unwrap().1,
+        state
+            .prs
+            .values()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>()
     );
 }

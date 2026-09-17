@@ -898,13 +898,23 @@ fn execute_with_links(
         .collect();
     integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
     report("linking pull requests into a GitHub stack");
-    integrations::gh_stack::link(
+    let desired_pull_requests: Vec<_> = prs.iter().map(|pr| pr.as_ref().unwrap().number).collect();
+    let existing_pull_requests: Vec<_> = desired_pull_requests
+        .iter()
+        .zip(&was_existing)
+        .filter_map(|(number, existed)| existed.then_some(*number))
+        .collect();
+    integrations::gh_stack::reconcile_and_link(
         runner,
         &plan.options.repo,
         &plan.fork,
         &plan.options.remote,
         &plan.options.base,
         &heads,
+        integrations::gh_stack::PullRequestMembership {
+            existing: &existing_pull_requests,
+            desired: &desired_pull_requests,
+        },
     )?;
     report(&format!(
         "\n{} pull requests in {}.",
