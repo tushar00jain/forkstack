@@ -111,8 +111,8 @@ pub fn reconcile_and_link(
 ) -> Result<(), String> {
     let stacks = existing_stacks(runner, repo, github_repo, pull_requests.existing)?;
     let desired: BTreeSet<_> = pull_requests.desired.iter().copied().collect();
-    let stale_members = stacks.values().any(|members| !members.is_subset(&desired));
-    if stacks.len() > 1 || stale_members {
+    let changed_membership = stacks.values().any(|members| members != &desired);
+    if stacks.len() > 1 || changed_membership {
         for stack_number in stacks.keys() {
             unstack(runner, repo, github_repo, *stack_number)?;
         }
@@ -238,9 +238,35 @@ mod tests {
     }
 
     #[test]
-    fn additive_stack_is_relinked_without_unstacking() {
+    fn additive_stack_is_unstacked_before_relinking() {
         let runner = ReconcileRunner {
             response: r#"[{"number":7,"pull_requests":[101]}]"#.into(),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        reconcile_and_link(
+            &runner,
+            Path::new("repo"),
+            "owner/repo",
+            "origin",
+            "main",
+            &["fs-head/topic/1".into(), "fs-head/topic/2".into()],
+            PullRequestMembership {
+                existing: &[101],
+                desired: &[101, 102],
+            },
+        )
+        .unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls[1], ["stack", "unstack", "7"]);
+        assert!(calls[2].starts_with(&["stack".into(), "link".into()]));
+    }
+
+    #[test]
+    fn reordered_stack_is_relinked_without_unstacking() {
+        let runner = ReconcileRunner {
+            response: r#"[{"number":7,"pull_requests":[102,101]}]"#.into(),
             calls: Mutex::new(Vec::new()),
         };
 
