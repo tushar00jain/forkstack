@@ -54,6 +54,69 @@ pub struct MovePlan {
 }
 
 impl Graph {
+    pub fn reset_local_preview(&self, remote: &str) -> (Self, usize, usize) {
+        let mut graph = self.clone();
+        let remote_prefix = format!("{remote}/fs-head/");
+        let remote_targets: HashMap<String, String> = self
+            .commits
+            .iter()
+            .flat_map(|(id, commit)| {
+                commit.remote_refs.iter().filter_map(|name| {
+                    name.strip_prefix(&remote_prefix)
+                        .map(|tail| (format!("fs-head/{tail}"), id.clone()))
+                })
+            })
+            .collect();
+        let local_targets: HashMap<String, String> = self
+            .commits
+            .iter()
+            .flat_map(|(id, commit)| {
+                commit
+                    .local_refs
+                    .iter()
+                    .filter(|name| name.starts_with("fs-head/"))
+                    .map(|name| (name.clone(), id.clone()))
+            })
+            .collect();
+        let updates: Vec<_> = local_targets
+            .iter()
+            .filter_map(|(branch, old)| {
+                let target = remote_targets.get(branch)?;
+                (old != target).then(|| (branch.clone(), target.clone()))
+            })
+            .collect();
+        let missing = local_targets
+            .keys()
+            .filter(|branch| !remote_targets.contains_key(*branch))
+            .count();
+        let moved: HashSet<_> = updates.iter().map(|(branch, _)| branch.clone()).collect();
+
+        for commit in graph.commits.values_mut() {
+            commit.local_refs.retain(|name| !moved.contains(name));
+        }
+        for (branch, target) in &updates {
+            if let Some(commit) = graph.commits.get_mut(target) {
+                commit.local_refs.push(branch.clone());
+                commit.local_refs.sort();
+                commit.preview = true;
+            }
+        }
+        if let Some((_, target)) = updates
+            .iter()
+            .find(|(branch, _)| Some(branch) == graph.branch.as_ref())
+        {
+            if let Some(commit) = graph.commits.get_mut(&graph.head) {
+                commit.is_head = false;
+            }
+            graph.head = target.clone();
+            if let Some(commit) = graph.commits.get_mut(target) {
+                commit.is_head = true;
+            }
+        }
+        graph.retain_reachable();
+        (graph, updates.len(), missing)
+    }
+
     pub fn publish_preview(&self, plan: &SubmitPlan) -> Result<Self, String> {
         let mut graph = self.clone();
         let local_heads: HashSet<_> = plan
@@ -698,6 +761,35 @@ mod tests {
         assert!(!preview.order.contains(&"remote-old".to_owned()));
         assert!(preview.commits.contains_key("a"));
         assert!(preview.order.contains(&"a".to_owned()));
+    }
+
+    #[test]
+    fn local_reset_preview_moves_only_heads_with_matching_remote_refs() {
+        let mut graph = graph();
+        graph.commits.get_mut("b").unwrap().local_refs =
+            vec!["fs-head/topic/1".into(), "fs-head/missing/1".into()];
+        graph.commits.get_mut("d").unwrap().remote_refs = vec!["origin/fs-head/topic/1".into()];
+        graph.head = "b".into();
+        graph.branch = Some("fs-head/topic/1".into());
+        graph.commits.get_mut("b").unwrap().is_head = true;
+
+        let (preview, updated, missing) = graph.reset_local_preview("origin");
+
+        assert_eq!((updated, missing), (1, 1));
+        assert_eq!(preview.head, "d");
+        assert!(preview.commits["d"].is_head);
+        assert!(preview.commits["d"].preview);
+        assert!(
+            preview.commits["d"]
+                .local_refs
+                .contains(&"fs-head/topic/1".into())
+        );
+        assert!(
+            preview.commits["b"]
+                .local_refs
+                .contains(&"fs-head/missing/1".into())
+        );
+        assert!(!preview.commits["b"].is_head);
     }
 
     #[test]

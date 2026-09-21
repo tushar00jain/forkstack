@@ -12,6 +12,7 @@ use crate::core::submit::{SubmitOptions, SubmitPlan};
 use crate::integrations::github::PullRequestLink;
 use crate::ui::git::{
     apply_move, checkout, displayed_remote_heads, load_graph_for, load_pr_links, remote_pr_links,
+    reset_local_heads,
 };
 use crate::ui::model::{Graph, MovePlan};
 
@@ -24,6 +25,7 @@ pub(crate) enum Operation {
         branch: Option<String>,
     },
     Apply(MovePlan),
+    ResetLocalHeads,
     PublishPreview(SubmitOptions),
     PublishExecute(SubmitPlan),
     Stop,
@@ -44,6 +46,7 @@ pub(crate) struct OperationResult {
     pub(crate) preview: Option<Graph>,
     pub(crate) publish_plan: Option<SubmitPlan>,
     pub(crate) pr_links: Option<Result<BTreeMap<String, PullRequestLink>, String>>,
+    pub(crate) operation_status: Option<String>,
     pub(crate) operation_error: Option<String>,
 }
 
@@ -128,6 +131,7 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
         let mut publish_plan = None;
         let mut pr_links = None;
         let mut loaded_graph = None;
+        let mut operation_status = None;
         let operation_error = match request.operation {
             Operation::Load => None,
             Operation::Refresh => {
@@ -146,6 +150,13 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
                 checkout(&repo, &revision, branch.as_deref()).err()
             }
             Operation::Apply(plan) => apply_move(&repo, &plan).err(),
+            Operation::ResetLocalHeads => match reset_local_heads(&repo, &options.remote) {
+                Ok(status) => {
+                    operation_status = Some(status);
+                    None
+                }
+                Err(error) => Some(error),
+            },
             Operation::PublishPreview(publish_options) => {
                 match crate::core::submit::plan(publish_options) {
                     Ok(plan) => match load_graph_for(&repo, &options.remote, &options.base) {
@@ -190,6 +201,7 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
                 preview,
                 publish_plan,
                 pr_links,
+                operation_status,
                 operation_error,
             })))
             .is_err()
@@ -213,6 +225,7 @@ mod tests {
             preview: None,
             publish_plan: None,
             pr_links: None,
+            operation_status: None,
             operation_error: None,
         }));
         events.send(event).unwrap();

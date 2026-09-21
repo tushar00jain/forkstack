@@ -49,8 +49,8 @@ fn move_pick(key: &KeyEvent) -> Option<bool> {
     }
 }
 
-fn preserve_preview_while_navigating(publish_active: bool) -> bool {
-    publish_active
+fn preserve_preview_while_navigating(non_move_preview_active: bool) -> bool {
+    non_move_preview_active
 }
 
 fn checkout_branch(graph: &Graph, commit: &str) -> Option<String> {
@@ -119,7 +119,8 @@ fn help_line(key: &str, label: &str) -> Line<'static> {
 fn help_lines() -> Vec<Line<'static>> {
     vec![
         help_line("m/M", "move commit / substack"),
-        help_line("p", "preview publish and stack link"),
+        help_line("l", "preview local reset to origin"),
+        help_line("o", "preview origin publish and stack link"),
         help_line("u", "preview upstream publish and stack link"),
         help_line("/", "search focused pane"),
         help_line("n/N", "next/previous match"),
@@ -233,6 +234,7 @@ struct RepositoryState {
     carried_commits: HashSet<String>,
     carry_substack: bool,
     pending: Option<MovePlan>,
+    reset_local_pending: bool,
     publish_plan: Option<SubmitPlan>,
     search: Search,
     status: Option<String>,
@@ -316,6 +318,7 @@ impl RepositoryState {
                     self.carried = None;
                     self.carried_commits.clear();
                     self.pending = None;
+                    self.reset_local_pending = false;
                     self.publish_plan = None;
                 }
                 let ids = self.graph_ids();
@@ -323,7 +326,7 @@ impl RepositoryState {
                     .filter(|id| ids.contains(id))
                     .or_else(|| ids.first().cloned());
                 self.status_error = response.operation_error.is_some();
-                self.status = response.operation_error;
+                self.status = response.operation_error.or(response.operation_status);
             }
             Err(error) => {
                 if !updates_links {
@@ -582,6 +585,7 @@ impl App {
         self.state.discard_preview = true;
         let had_preview = self.state.preview.take().is_some();
         self.state.pending = None;
+        self.state.reset_local_pending = false;
         self.state.publish_plan = None;
         if !keep_carried {
             self.state.carried = None;
@@ -628,7 +632,9 @@ impl App {
     }
 
     fn move_cursor(&mut self, amount: isize) {
-        if !preserve_preview_while_navigating(self.state.publish_plan.is_some()) {
+        if !preserve_preview_while_navigating(
+            self.state.publish_plan.is_some() || self.state.reset_local_pending,
+        ) {
             self.clear_preview(true);
         }
         let ids = self.graph_ids();
@@ -680,6 +686,16 @@ impl App {
         }
         if self.state.publish_plan.is_some() {
             self.execute_publish();
+            return;
+        }
+        if self.state.reset_local_pending {
+            if self.start_operation(
+                Operation::ResetLocalHeads,
+                Busy::Mutation,
+                "resetting local branches…",
+            ) {
+                self.state.reset_local_pending = false;
+            }
             return;
         }
         let Some(selected) = self.state.selected.clone() else {
@@ -761,9 +777,41 @@ impl App {
         );
     }
 
+    fn preview_local_reset(&mut self) {
+        if self.state.busy.is_some() {
+            self.reject_busy_operation();
+            return;
+        }
+        self.clear_preview(false);
+        let Some(graph) = self.state.graph.as_ref() else {
+            return;
+        };
+        let remote = &self.publish_options.remote;
+        let (preview, updated, missing) = graph.reset_local_preview(remote);
+        if updated == 0 {
+            self.state.status = Some(if missing == 0 {
+                format!("local branches already match {remote}")
+            } else {
+                format!(
+                    "local branches already match {remote}; skipped {missing} without a matching remote branch"
+                )
+            });
+        } else {
+            self.state.preview = Some(preview);
+            self.state.reset_local_pending = true;
+            self.state.status = Some(format!(
+                "previewing reset of {updated} local branch{} to {remote}; press Enter to confirm",
+                if updated == 1 { "" } else { "es" }
+            ));
+            self.update_rendered();
+        }
+        self.state.status_error = false;
+        self.dirty = true;
+    }
+
     fn execute_publish(&mut self) {
         let Some(plan) = self.state.publish_plan.clone() else {
-            self.state.status = Some("press p or u to preview publish changes first".into());
+            self.state.status = Some("press o or u to preview publish changes first".into());
             self.state.status_error = true;
             return;
         };
@@ -886,7 +934,7 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('m' | 'M' | 'p' | 'r' | 'u' | 'q')
+                KeyCode::Enter | KeyCode::Char('l' | 'm' | 'M' | 'o' | 'r' | 'u' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -900,7 +948,8 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char('p'), _) => self.preview_publish(self.publish_options.remote.clone()),
+            (KeyCode::Char('l'), _) => self.preview_local_reset(),
+            (KeyCode::Char('o'), _) => self.preview_publish(self.publish_options.remote.clone()),
             (KeyCode::Char('u'), _) => self.preview_publish("upstream".into()),
             (KeyCode::Esc, _) => self.clear_preview(false),
             (KeyCode::Char('/'), _) => {
@@ -1266,6 +1315,7 @@ mod tests {
             preview: None,
             publish_plan: None,
             pr_links: None,
+            operation_status: None,
             operation_error: None,
         }
     }
@@ -1505,7 +1555,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_preserves_only_publish_previews() {
+    fn navigation_preserves_non_move_previews() {
         assert!(preserve_preview_while_navigating(true));
         assert!(!preserve_preview_while_navigating(false));
     }
@@ -1570,10 +1620,11 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 6);
+        assert_eq!(help.len(), 7);
         for binding in [
             "m/M          move commit / substack",
-            "p            preview publish and stack link",
+            "l            preview local reset to origin",
+            "o            preview origin publish and stack link",
             "u            preview upstream publish and stack link",
             "/            search focused pane",
             "r            rescan and refresh active graph/PRs",
@@ -1592,10 +1643,10 @@ mod tests {
     }
 
     #[test]
-    fn publish_keys_select_the_configured_and_upstream_remotes() {
+    fn remote_keys_select_the_configured_and_upstream_remotes() {
         let (mut origin_app, origin_operations, _events) = test_app();
         origin_app.publish_options.remote = "origin".into();
-        origin_app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        origin_app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
         assert!(matches!(
             origin_operations.recv().unwrap().operation,
             Operation::PublishPreview(options) if options.remote == "origin"
@@ -1607,6 +1658,47 @@ mod tests {
             upstream_operations.recv().unwrap().operation,
             Operation::PublishPreview(options) if options.remote == "upstream"
         ));
+    }
+
+    #[test]
+    fn local_key_previews_and_enter_confirms_head_reset() {
+        let (mut app, operations, _events) = test_app();
+        app.state.graph = Some(Graph {
+            commits: [
+                (
+                    "local".into(),
+                    crate::ui::model::Commit {
+                        id: "local".into(),
+                        local_refs: vec!["fs-head/topic/1".into()],
+                        is_head: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "remote".into(),
+                    crate::ui::model::Commit {
+                        id: "remote".into(),
+                        remote_refs: vec!["origin/fs-head/topic/1".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            order: vec!["local".into(), "remote".into()],
+            head: "local".into(),
+            branch: Some("fs-head/topic/1".into()),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE));
+        assert!(operations.try_recv().is_err());
+        assert!(app.state.reset_local_pending);
+        assert!(app.state.preview.is_some());
+
+        app.enter();
+        assert!(matches!(
+            operations.recv().unwrap().operation,
+            Operation::ResetLocalHeads
+        ));
+        assert_eq!(app.state.busy, Some(Busy::Mutation));
     }
 
     #[test]
@@ -1650,7 +1742,7 @@ mod tests {
     #[test]
     fn removed_stack_and_uppercase_keys_do_nothing() {
         let (mut app, operations, _events) = test_app();
-        for key in ['a', 's', 'P', 'R'] {
+        for key in ['a', 'p', 's', 'P', 'R'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
         }
         assert!(matches!(
@@ -1907,7 +1999,8 @@ mod tests {
             KeyCode::Char('m'),
             KeyCode::Char('M'),
             KeyCode::Enter,
-            KeyCode::Char('p'),
+            KeyCode::Char('l'),
+            KeyCode::Char('o'),
             KeyCode::Char('r'),
             KeyCode::Char('u'),
             KeyCode::Char('q'),

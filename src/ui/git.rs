@@ -282,6 +282,130 @@ pub fn checkout(repo: &Path, revision: &str, branch: Option<&str>) -> Result<(),
     Ok(())
 }
 
+/// Force every existing local `fs-head/*` branch to the matching fetched ref
+/// for `remote`. Branches without a matching remote ref are left alone.
+pub fn reset_local_heads(repo: &Path, remote: &str) -> Result<String, String> {
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    if repository.state() != RepositoryState::Clean {
+        return Err("cannot reset local branches while a Git operation is in progress".into());
+    }
+    if !run(repo, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+        return Err("cannot reset local branches with uncommitted tracked changes".into());
+    }
+
+    let current = repository
+        .head()
+        .ok()
+        .filter(|head| head.is_branch())
+        .and_then(|head| head.name().map(str::to_owned));
+    let mut checked_out_elsewhere = BTreeSet::new();
+    for name in repository
+        .worktrees()
+        .map_err(|error| error.message().to_owned())?
+        .iter()
+        .flatten()
+    {
+        let worktree = repository
+            .find_worktree(name)
+            .map_err(|error| error.message().to_owned())?;
+        let worktree_repo =
+            Repository::open(worktree.path()).map_err(|error| error.message().to_owned())?;
+        if let Ok(head) = worktree_repo.head()
+            && let Some(name) = head.name()
+            && Some(name) != current.as_deref()
+        {
+            checked_out_elsewhere.insert(name.to_owned());
+        }
+    }
+
+    let mut updates = Vec::new();
+    let mut missing = Vec::new();
+    for reference in repository
+        .references_glob("refs/heads/fs-head/*")
+        .map_err(|error| error.message().to_owned())?
+    {
+        let reference = reference.map_err(|error| error.message().to_owned())?;
+        let Some(local_name) = reference.name() else {
+            continue;
+        };
+        let short_name = local_name.trim_start_matches("refs/heads/");
+        let remote_name = format!("refs/remotes/{remote}/{short_name}");
+        let Ok(remote_ref) = repository.find_reference(&remote_name) else {
+            missing.push(short_name.to_owned());
+            continue;
+        };
+        let old = reference
+            .peel_to_commit()
+            .map_err(|error| error.message().to_owned())?
+            .id();
+        let wanted = remote_ref
+            .peel_to_commit()
+            .map_err(|error| error.message().to_owned())?
+            .id();
+        if old != wanted {
+            if checked_out_elsewhere.contains(local_name) {
+                return Err(format!(
+                    "cannot reset {short_name:?}: it is checked out in another worktree"
+                ));
+            }
+            updates.push((local_name.to_owned(), old, wanted));
+        }
+    }
+
+    if !updates.is_empty() {
+        let mut transaction = repository
+            .transaction()
+            .map_err(|error| error.message().to_owned())?;
+        for (name, _, _) in &updates {
+            transaction
+                .lock_ref(name)
+                .map_err(|error| error.message().to_owned())?;
+        }
+        for (name, old, wanted) in &updates {
+            let actual = repository
+                .find_reference(name)
+                .ok()
+                .and_then(|reference| reference.peel_to_commit().ok())
+                .map(|commit| commit.id());
+            if actual != Some(*old) {
+                return Err(format!("reference {name} changed while preparing updates"));
+            }
+            transaction
+                .set_target(
+                    name,
+                    *wanted,
+                    None,
+                    "forkstack: reset local branch to remote",
+                )
+                .map_err(|error| error.message().to_owned())?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| error.message().to_owned())?;
+    }
+
+    if current
+        .as_ref()
+        .is_some_and(|current| updates.iter().any(|(name, _, _)| name == current))
+    {
+        run(repo, &["reset", "--hard", "HEAD"])?;
+    }
+
+    let updated = updates.len();
+    let skipped = missing.len();
+    let mut status = match updated {
+        0 => format!("local branches already match {remote}"),
+        1 => format!("reset 1 local branch to {remote}"),
+        _ => format!("reset {updated} local branches to {remote}"),
+    };
+    if skipped != 0 {
+        status.push_str(&format!(
+            "; skipped {skipped} without a matching remote branch"
+        ));
+    }
+    Ok(status)
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }

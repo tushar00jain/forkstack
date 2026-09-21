@@ -10,7 +10,9 @@ use forkstack::core::submit::{
     SubmitOptions, assign_branches, execute_with, identity_from_message, plan,
 };
 use forkstack::integrations::{CommandRunner, ProcessRunner};
-use forkstack::ui::git::{apply_move, apply_move_with_test_executable, checkout};
+use forkstack::ui::git::{
+    apply_move, apply_move_with_test_executable, checkout, reset_local_heads,
+};
 use forkstack::ui::model::MovePlan;
 use serde_json::json;
 
@@ -939,6 +941,79 @@ fn divergent_local_head_is_not_overwritten() {
 }
 
 #[test]
+fn explicit_local_reset_matches_fetched_origin_heads() {
+    let fixture = fixture();
+    for (branch, revision) in [
+        ("fs-head/draft/1", fixture.first.as_str()),
+        ("fs-head/draft/2", fixture.second.as_str()),
+    ] {
+        git(
+            &fixture.repo,
+            &["push", "origin", &format!("{revision}:refs/heads/{branch}")],
+        );
+    }
+    fetch_all(&fixture.repo);
+    git(
+        &fixture.repo,
+        &["branch", "fs-head/draft/1", &fixture.second],
+    );
+    git(&fixture.repo, &["branch", "fs-head/draft/2", &fixture.base]);
+    git(
+        &fixture.repo,
+        &["branch", "fs-head/missing/1", &fixture.base],
+    );
+    git(&fixture.repo, &["switch", "fs-head/draft/1"]);
+
+    let status = reset_local_heads(&fixture.repo, "origin").unwrap();
+
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]),
+        fixture.first
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/2"]),
+        fixture.second
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/missing/1"]),
+        fixture.base
+    );
+    assert_eq!(git(&fixture.repo, &["rev-parse", "HEAD"]), fixture.first);
+    assert!(!fixture.repo.join("second").exists());
+    assert_eq!(
+        status,
+        "reset 2 local branches to origin; skipped 1 without a matching remote branch"
+    );
+}
+
+#[test]
+fn local_reset_refuses_uncommitted_tracked_changes() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/fs-head/draft/1", fixture.first),
+        ],
+    );
+    fetch_all(&fixture.repo);
+    git(
+        &fixture.repo,
+        &["branch", "fs-head/draft/1", &fixture.second],
+    );
+    fs::write(fixture.repo.join("first"), "uncommitted\n").unwrap();
+
+    let error = reset_local_heads(&fixture.repo, "origin").unwrap_err();
+
+    assert!(error.contains("uncommitted tracked changes"), "{error}");
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]),
+        fixture.second
+    );
+}
+
+#[test]
 fn head_checked_out_in_another_worktree_is_not_overwritten() {
     let fixture = fixture();
     git(
@@ -1207,10 +1282,6 @@ fn removed_layer_is_unstacked_before_the_remaining_prs_are_relinked() {
     );
     assert_eq!(
         state.stack.as_ref().unwrap().1,
-        state
-            .prs
-            .values()
-            .map(|pr| pr.number)
-            .collect::<Vec<_>>()
+        state.prs.values().map(|pr| pr.number).collect::<Vec<_>>()
     );
 }

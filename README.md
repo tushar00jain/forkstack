@@ -41,9 +41,10 @@ forkstack log --no-remotes -n 20
 | --- | --- |
 | `Tab` / `Shift-Tab` | Focus the next / previous pane |
 | `j/k`, `Up` / `Down` | Navigate the focused pane |
-| `Enter` | Activate a repository; in the graph, check out or preview/confirm a move |
+| `Enter` | Activate a repository; in the graph, check out or confirm a preview |
 | `m` / `M` | Move one commit / a substack |
-| `p` | Preview publishing and linking the stack on `origin` |
+| `l` | Preview resetting local `fs-head/*` branches to fetched `origin/*` refs |
+| `o` | Preview publishing and linking the stack on `origin` |
 | `u` | Preview publishing and linking the stack on `upstream` |
 | `Esc` | Exit search, clear a repository filter, or cancel a graph preview |
 | `/` | Filter repositories by name/path or search commits in the focused pane |
@@ -51,6 +52,11 @@ forkstack log --no-remotes -n 20
 | `r` | Rescan repositories; in the graph, also refresh graph and PR links |
 | `?` | Show the complete key map |
 | `q` | Quit |
+
+`l`, followed by `Enter`, uses the configured fork remote (`origin` by default)
+and the already-fetched remote-tracking refs. It discards local-only commits on
+matching `fs-head/*` branches, leaves branches missing from the remote unchanged,
+and refuses to run when tracked files have uncommitted changes.
 
 Opening a parent folder starts in the repository sidebar. Highlighting or filtering
 repositories does not load history: press `Enter` to activate one, then `Tab` to
