@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::core::submit::{SubmitOptions, SubmitPlan};
 use crate::integrations::github::PullRequestLink;
 use crate::ui::event::{self, Operation, OperationRequest, OperationResult, UiEvent};
-use crate::ui::model::{Graph, MovePlan};
+use crate::ui::model::{Graph, MoveMode, MovePlan};
 use crate::ui::render::{RenderedLine, TextKind, attach_pr_links, commit_label, render_graph};
 use crate::ui::workspace::{self, Workspace};
 
@@ -41,10 +41,12 @@ struct Search {
     matches: Vec<String>,
 }
 
-fn move_pick(key: &KeyEvent) -> Option<bool> {
+fn move_pick(key: &KeyEvent) -> Option<(bool, MoveMode)> {
     match key.code {
-        KeyCode::Char('m') => Some(false),
-        KeyCode::Char('M') => Some(true),
+        KeyCode::Char('m') => Some((false, MoveMode::Direct)),
+        KeyCode::Char('M') => Some((true, MoveMode::Direct)),
+        KeyCode::Char('z') => Some((false, MoveMode::Reorder)),
+        KeyCode::Char('Z') => Some((true, MoveMode::Reorder)),
         _ => None,
     }
 }
@@ -118,7 +120,8 @@ fn help_line(key: &str, label: &str) -> Line<'static> {
 
 fn help_lines() -> Vec<Line<'static>> {
     vec![
-        help_line("m/M", "move commit / substack"),
+        help_line("m/M", "move exact commit / substack"),
+        help_line("z/Z", "reorder commit / substack"),
         help_line("l", "preview local reset to origin"),
         help_line("o", "preview origin publish and stack link"),
         help_line("u", "preview upstream publish and stack link"),
@@ -233,6 +236,7 @@ struct RepositoryState {
     carried: Option<String>,
     carried_commits: HashSet<String>,
     carry_substack: bool,
+    move_mode: MoveMode,
     pending: Option<MovePlan>,
     reset_local_pending: bool,
     publish_plan: Option<SubmitPlan>,
@@ -651,7 +655,7 @@ impl App {
         self.state.selected = Some(ids[next].clone());
     }
 
-    fn pick(&mut self, substack: bool) {
+    fn pick(&mut self, substack: bool, mode: MoveMode) {
         let Some(selected) = self.state.selected.clone() else {
             return;
         };
@@ -675,6 +679,7 @@ impl App {
         self.state.carried = Some(selected);
         self.state.carried_commits = commits.into_iter().collect();
         self.state.carry_substack = substack;
+        self.state.move_mode = mode;
         self.state.status = None;
         self.state.status_error = false;
     }
@@ -705,12 +710,16 @@ impl App {
             let Some(graph) = self.state.graph.as_ref() else {
                 return;
             };
-            match graph
-                .plan_move(&carried, &selected, self.state.carry_substack)
-                .and_then(|plan| {
-                    let preview = graph.preview(&plan)?;
-                    Ok((plan, preview))
-                }) {
+            let plan = match self.state.move_mode {
+                MoveMode::Direct => graph.plan_move(&carried, &selected, self.state.carry_substack),
+                MoveMode::Reorder => {
+                    graph.plan_reorder(&carried, &selected, self.state.carry_substack)
+                }
+            };
+            match plan.and_then(|plan| {
+                let preview = graph.preview(&plan)?;
+                Ok((plan, preview))
+            }) {
                 Ok((plan, preview)) => {
                     self.state.pending = Some(plan);
                     self.state.preview = Some(preview);
@@ -934,14 +943,14 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('l' | 'm' | 'M' | 'o' | 'r' | 'u' | 'q')
+                KeyCode::Enter | KeyCode::Char('l' | 'm' | 'M' | 'z' | 'Z' | 'o' | 'r' | 'u' | 'q')
             )
         {
             self.reject_busy_operation();
             return true;
         }
-        if let Some(substack) = move_pick(&key) {
-            self.pick(substack);
+        if let Some((substack, mode)) = move_pick(&key) {
+            self.pick(substack, mode);
             return true;
         }
         match (key.code, key.modifiers) {
@@ -1535,14 +1544,22 @@ mod tests {
     }
 
     #[test]
-    fn move_bindings_use_lowercase_for_commit_and_uppercase_for_substack() {
+    fn move_bindings_select_scope_and_behavior() {
         assert_eq!(
             move_pick(&KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE)),
-            Some(false)
+            Some((false, MoveMode::Direct))
         );
         assert_eq!(
             move_pick(&KeyEvent::new(KeyCode::Char('M'), KeyModifiers::SHIFT)),
-            Some(true)
+            Some((true, MoveMode::Direct))
+        );
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE)),
+            Some((false, MoveMode::Reorder))
+        );
+        assert_eq!(
+            move_pick(&KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT)),
+            Some((true, MoveMode::Reorder))
         );
         assert_eq!(
             move_pick(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
@@ -1620,9 +1637,10 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 7);
+        assert_eq!(help.len(), 8);
         for binding in [
-            "m/M          move commit / substack",
+            "m/M          move exact commit / substack",
+            "z/Z          reorder commit / substack",
             "l            preview local reset to origin",
             "o            preview origin publish and stack link",
             "u            preview upstream publish and stack link",
@@ -1711,6 +1729,7 @@ mod tests {
             base: "base".into(),
             source_base: "source-base".into(),
             carried_count: 1,
+            mode: MoveMode::Reorder,
             tip: "tip".into(),
             tip_commit: "tip-commit".into(),
             detach_for_rewrite: false,
@@ -1998,6 +2017,8 @@ mod tests {
         for key in [
             KeyCode::Char('m'),
             KeyCode::Char('M'),
+            KeyCode::Char('z'),
+            KeyCode::Char('Z'),
             KeyCode::Enter,
             KeyCode::Char('l'),
             KeyCode::Char('o'),

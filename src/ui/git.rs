@@ -9,7 +9,7 @@ use git2::{Oid, Repository, RepositoryState, Sort};
 
 use crate::integrations::ProcessRunner;
 use crate::integrations::github::{PullRequestLink, discover_pr_links};
-use crate::ui::model::{Commit, Graph, MovePlan};
+use crate::ui::model::{Commit, Graph, MoveMode, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
@@ -523,7 +523,8 @@ fn apply_move_with_executable(
     plan: &MovePlan,
     executable: &Path,
 ) -> Result<(), String> {
-    let detached_rewrite = plan.detach_for_rewrite && !plan.include_descendants;
+    let detached_rewrite =
+        plan.mode == MoveMode::Reorder && plan.detach_for_rewrite && !plan.include_descendants;
     let original_checkout = if detached_rewrite {
         let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
         let head = repository
@@ -542,7 +543,7 @@ fn apply_move_with_executable(
     if detached_rewrite {
         run(repo, &["switch", "--detach", &plan.tip_commit])?;
     }
-    let result = if plan.include_descendants {
+    let result = if plan.mode == MoveMode::Direct || plan.include_descendants {
         run_explicit_rebase(repo, plan, executable)?
     } else {
         let stamp = SystemTime::now()
@@ -845,6 +846,7 @@ mod tests {
             base: "alpha2".into(),
             source_base: "beta1".into(),
             carried_count: 2,
+            mode: MoveMode::Reorder,
             tip: "fs-head/gamma/3".into(),
             tip_commit: "gamma3".into(),
             detach_for_rewrite: true,

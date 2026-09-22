@@ -34,9 +34,9 @@ pub struct MovePlan {
     /// rebases the carried commits from this base onto `destination`.
     pub source_base: String,
     /// Number of commits at the start of `commits` that belong to the carried
-    /// substack. Any remaining commits are destination descendants replayed
-    /// above the insertion.
+    /// selection. Reorder plans may append destination descendants.
     pub carried_count: usize,
+    pub mode: MoveMode,
     /// A local branch name when possible, otherwise a commit id.
     pub tip: String,
     pub tip_commit: String,
@@ -51,6 +51,13 @@ pub struct MovePlan {
     pub ref_updates: Vec<(String, String)>,
     /// Old commit ids, in the order the rebase will replay them.
     pub commits: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MoveMode {
+    #[default]
+    Direct,
+    Reorder,
 }
 
 impl Graph {
@@ -283,10 +290,14 @@ impl Graph {
         self.linear_segment(&parent, &tip_commit)
     }
 
-    fn descendant_stack_tip(&self, destination: &str) -> Result<(String, String), String> {
+    fn descendant_stack_tip(
+        &self,
+        destination: &str,
+        excluded: &HashSet<String>,
+    ) -> Result<(String, String), String> {
         let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
         for commit in self.commits.values() {
-            if !self.is_ancestor(destination, &commit.id) {
+            if excluded.contains(&commit.id) || !self.is_ancestor(destination, &commit.id) {
                 continue;
             }
             for name in &commit.local_refs {
@@ -317,7 +328,78 @@ impl Graph {
         }
     }
 
+    fn direct_commit_branch(&self, selected: &str) -> Result<String, String> {
+        let commit = self
+            .commits
+            .get(selected)
+            .ok_or_else(|| format!("unknown commit {selected}"))?;
+        let mut branches = commit.local_refs.clone();
+        branches.sort();
+        if let Some(current) = self
+            .branch
+            .as_ref()
+            .filter(|current| branches.contains(current))
+        {
+            return Ok(current.clone());
+        }
+        branches.into_iter().next().ok_or_else(|| {
+            "an exact single-commit move requires a local branch on the selected commit".into()
+        })
+    }
+
+    /// Rebase exactly the selected commit or substack onto `destination`.
     pub fn plan_move(
+        &self,
+        selected: &str,
+        destination: &str,
+        include_descendants: bool,
+    ) -> Result<MovePlan, String> {
+        if selected == destination {
+            return Err("a commit cannot be dropped onto itself".into());
+        }
+        let parent = self.first_parent(selected)?;
+        if destination == parent {
+            return Err("that move would not change the stack".into());
+        }
+        if self.is_ancestor(selected, destination) {
+            return Err("the destination descends from the selected commit".into());
+        }
+        let (tip, tip_commit, detach_for_rewrite, commits) = if include_descendants {
+            let (tip, tip_commit, detach_for_rewrite) = self.stack_tip(selected)?;
+            let commits = self.linear_segment(&parent, &tip_commit)?;
+            (tip, tip_commit, detach_for_rewrite, commits)
+        } else {
+            let tip = self.direct_commit_branch(selected)?;
+            let detach_for_rewrite = tip.starts_with("fs-head/");
+            (
+                tip,
+                selected.to_owned(),
+                detach_for_rewrite,
+                vec![selected.into()],
+            )
+        };
+        let checkout_branch = tip.clone();
+        let ref_updates = self.ref_updates(&commits);
+        Ok(MovePlan {
+            selected: selected.into(),
+            destination: destination.into(),
+            include_descendants,
+            base: destination.into(),
+            source_base: parent,
+            carried_count: commits.len(),
+            mode: MoveMode::Direct,
+            tip,
+            tip_commit,
+            detach_for_rewrite,
+            checkout_branch,
+            ref_updates,
+            commits,
+        })
+    }
+
+    /// Insert the selected commit or substack after `destination`, replaying
+    /// the rest of the destination stack above it.
+    pub fn plan_reorder(
         &self,
         selected: &str,
         destination: &str,
@@ -337,18 +419,12 @@ impl Graph {
             if self.is_ancestor(selected, destination) {
                 return Err("the destination is inside the selected substack".into());
             }
+            let carried_ids: HashSet<_> = carried.iter().cloned().collect();
             let (destination_tip, destination_tip_commit) =
-                self.descendant_stack_tip(destination)?;
-            let destination_descendants =
+                self.descendant_stack_tip(destination, &carried_ids)?;
+            let mut destination_descendants =
                 self.linear_segment(destination, &destination_tip_commit)?;
-            if carried
-                .iter()
-                .any(|id| destination_descendants.contains(id))
-            {
-                return Err(
-                    "the destination descendant chain overlaps the selected substack".into(),
-                );
-            }
+            destination_descendants.retain(|id| !carried_ids.contains(id));
             let carried_count = carried.len();
             let mut commits = carried;
             commits.extend(destination_descendants);
@@ -368,6 +444,7 @@ impl Graph {
                 base: destination.into(),
                 source_base: parent,
                 carried_count,
+                mode: MoveMode::Reorder,
                 tip: resulting_tip,
                 tip_commit: resulting_tip_commit,
                 detach_for_rewrite,
@@ -411,6 +488,7 @@ impl Graph {
             base,
             source_base: parent,
             carried_count: 1,
+            mode: MoveMode::Reorder,
             tip,
             tip_commit,
             detach_for_rewrite,
@@ -504,6 +582,9 @@ impl Graph {
                 commit.is_head = false;
             }
         }
+        if let Some(commit) = graph.commits.get_mut(&graph.head) {
+            commit.is_head = false;
+        }
         let old_tip_virtual = virtual_ids
             .get(&plan.tip_commit)
             .cloned()
@@ -588,9 +669,9 @@ mod tests {
     }
 
     #[test]
-    fn plans_single_commit_and_substack_moves() {
+    fn plans_single_commit_and_substack_reorders() {
         let mut graph = graph();
-        let single = graph.plan_move("b", "c", false).unwrap();
+        let single = graph.plan_reorder("b", "c", false).unwrap();
         assert_eq!(
             single.commits,
             vec!["c".to_owned(), "b".to_owned(), "d".to_owned()]
@@ -604,7 +685,7 @@ mod tests {
                 ..Commit::default()
             },
         );
-        let substack = graph.plan_move("c", "x", true).unwrap();
+        let substack = graph.plan_reorder("c", "x", true).unwrap();
         assert!(substack.include_descendants);
         assert_eq!(substack.commits, vec!["c".to_owned(), "d".to_owned()]);
         assert_eq!(substack.destination, "x");
@@ -621,7 +702,7 @@ mod tests {
         graph.head = "c".into();
         graph.branch = Some("fs-head/test/2".into());
 
-        let plan = graph.plan_move("b", "c", false).unwrap();
+        let plan = graph.plan_reorder("b", "c", false).unwrap();
         assert_eq!(plan.tip, "fs-head/test/3");
         assert_eq!(plan.tip_commit, "d");
         assert_eq!(
@@ -633,7 +714,7 @@ mod tests {
     #[test]
     fn preview_moves_local_refs_but_preserves_remote_refs() {
         let graph = graph();
-        let plan = graph.plan_move("b", "c", false).unwrap();
+        let plan = graph.plan_reorder("b", "c", false).unwrap();
         let preview = graph.preview(&plan).unwrap();
         assert!(
             preview.commits["d"]
@@ -801,7 +882,7 @@ mod tests {
             .unwrap()
             .local_refs
             .push("marker".into());
-        let plan = graph.plan_move("b", "d", false).unwrap();
+        let plan = graph.plan_reorder("b", "d", false).unwrap();
         assert_eq!(
             plan.commits,
             vec!["c".to_owned(), "d".to_owned(), "b".to_owned()]
@@ -841,7 +922,7 @@ mod tests {
         graph.commits.get_mut("d").unwrap().local_refs = vec!["fs-head/test/3".into()];
         graph.branch = Some("fs-head/test/3".into());
 
-        let plan = graph.plan_move("c", "d", false).unwrap();
+        let plan = graph.plan_reorder("c", "d", false).unwrap();
         assert_eq!(plan.commits, vec!["d".to_owned(), "c".to_owned()]);
         assert!(plan.detach_for_rewrite);
         assert_eq!(plan.checkout_branch, "fs-head/test/2");
@@ -898,11 +979,104 @@ mod tests {
         }
     }
 
+    fn linear_forkstack_graph() -> Graph {
+        let entries = [
+            ("main", None, Some("main")),
+            ("draft3", Some("main"), Some("fs-head/draft/3")),
+            ("draft7", Some("draft3"), Some("fs-head/draft/7")),
+            ("draft6", Some("draft7"), Some("fs-head/draft/6")),
+            ("draft5", Some("draft6"), Some("fs-head/draft/5")),
+            ("rdma2", Some("draft5"), Some("fs-head/rdma/2")),
+            ("rdma3", Some("rdma2"), Some("fs-head/rdma/3")),
+        ];
+        let commits = entries
+            .into_iter()
+            .map(|(id, parent, branch)| {
+                (
+                    id.into(),
+                    Commit {
+                        id: id.into(),
+                        parents: parent.into_iter().map(str::to_owned).collect(),
+                        subject: id.into(),
+                        local_refs: branch.into_iter().map(str::to_owned).collect(),
+                        is_head: id == "rdma3",
+                        ..Commit::default()
+                    },
+                )
+            })
+            .collect();
+        Graph {
+            commits,
+            order: entries
+                .iter()
+                .rev()
+                .map(|(id, _, _)| (*id).into())
+                .collect(),
+            head: "rdma3".into(),
+            branch: Some("fs-head/rdma/3".into()),
+        }
+    }
+
+    #[test]
+    fn direct_moves_create_parallel_trees() {
+        let graph = linear_forkstack_graph();
+
+        let single = graph.plan_move("rdma2", "main", false).unwrap();
+        assert_eq!(single.mode, MoveMode::Direct);
+        assert_eq!(single.commits, ["rdma2"]);
+        assert_eq!(single.checkout_branch, "fs-head/rdma/2");
+        let single_preview = graph.preview(&single).unwrap();
+        assert_eq!(single_preview.commits["preview:rdma2"].parents, ["main"]);
+        assert_eq!(single_preview.head, "preview:rdma2");
+        assert!(!single_preview.commits["rdma3"].is_head);
+        assert!(
+            single_preview.commits["rdma3"]
+                .local_refs
+                .contains(&"fs-head/rdma/3".into())
+        );
+
+        let substack = graph.plan_move("rdma2", "main", true).unwrap();
+        assert_eq!(substack.mode, MoveMode::Direct);
+        assert_eq!(substack.commits, ["rdma2", "rdma3"]);
+        assert_eq!(substack.checkout_branch, "fs-head/rdma/3");
+        let substack_preview = graph.preview(&substack).unwrap();
+        assert_eq!(substack_preview.commits["preview:rdma2"].parents, ["main"]);
+        assert_eq!(
+            substack_preview.commits["preview:rdma3"].parents,
+            ["preview:rdma2"]
+        );
+        assert!(
+            substack_preview.commits["draft5"]
+                .local_refs
+                .contains(&"fs-head/draft/5".into())
+        );
+    }
+
+    #[test]
+    fn substack_reorder_places_the_remaining_destination_tree_on_top() {
+        let graph = linear_forkstack_graph();
+
+        let plan = graph.plan_reorder("rdma2", "main", true).unwrap();
+
+        assert_eq!(plan.mode, MoveMode::Reorder);
+        assert_eq!(plan.carried_count, 2);
+        assert_eq!(
+            plan.commits,
+            ["rdma2", "rdma3", "draft3", "draft7", "draft6", "draft5"]
+        );
+        assert_eq!(plan.checkout_branch, "fs-head/draft/5");
+        let preview = graph.preview(&plan).unwrap();
+        assert_eq!(preview.commits["preview:rdma2"].parents, ["main"]);
+        assert_eq!(preview.commits["preview:rdma3"].parents, ["preview:rdma2"]);
+        assert_eq!(preview.commits["preview:draft3"].parents, ["preview:rdma3"]);
+        assert_eq!(preview.head, "preview:draft5");
+    }
+
     #[test]
     fn substack_insertion_replays_destination_descendants_above_carried_commits() {
         let graph = insertion_graph();
         assert_eq!(graph.carried_substack("beta2").unwrap(), ["beta2", "beta3"]);
-        let plan = graph.plan_move("beta3", "alpha2", true).unwrap();
+        let plan = graph.plan_reorder("beta3", "alpha2", true).unwrap();
 
         assert_eq!(plan.base, "alpha2");
         assert_eq!(plan.source_base, "beta2");
@@ -938,7 +1112,7 @@ mod tests {
             },
         );
 
-        let error = graph.plan_move("beta3", "alpha2", true).unwrap_err();
+        let error = graph.plan_reorder("beta3", "alpha2", true).unwrap_err();
         assert!(error.contains("multiple descendant stack tips"));
     }
 }

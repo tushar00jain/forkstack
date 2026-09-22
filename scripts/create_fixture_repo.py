@@ -11,8 +11,8 @@ The generated graph is:
 Each stack commit has an ``fs-branch`` trailer plus matching local and remote
 ``fs-head`` refs. Remote ``fs-base`` refs reproduce the layout made by
 ``forkstack submit --execute``. ``main-3`` creates ``shared.txt``; ``alpha-2``
-and ``beta-2`` make conflicting edits to it so inserting the beta substack
-after ``alpha-2`` demonstrates the UI's conflict state.
+and ``beta-2`` make conflicting edits to it so reordering the beta substack
+after ``alpha-2`` with ``Z`` demonstrates the UI's conflict state.
 """
 
 from __future__ import annotations

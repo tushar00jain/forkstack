@@ -42,7 +42,8 @@ forkstack log --no-remotes -n 20
 | `Tab` / `Shift-Tab` | Focus the next / previous pane |
 | `j/k`, `Up` / `Down` | Navigate the focused pane |
 | `Enter` | Activate a repository; in the graph, check out or confirm a preview |
-| `m` / `M` | Move one commit / a substack |
+| `m` / `M` | Move exactly one commit / a substack onto a destination |
+| `z` / `Z` | Reorder one commit / a substack while preserving destination descendants |
 | `l` | Preview resetting local `fs-head/*` branches to fetched `origin/*` refs |
 | `o` | Preview publishing and linking the stack on `origin` |
 | `u` | Preview publishing and linking the stack on `upstream` |
@@ -82,7 +83,7 @@ python3 scripts/create_fixture_repo.py --force
 cargo run -- ui --repo fixture/repo
 ```
 
-Moving the `beta/2` substack after `alpha/2` intentionally conflicts in
+Reordering the `beta/2` substack after `alpha/2` with `Z` intentionally conflicts in
 `shared.txt`, allowing the conflict UI and `git rebase --continue` workflow to
 be tested.
 

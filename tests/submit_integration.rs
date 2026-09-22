@@ -11,9 +11,9 @@ use forkstack::core::submit::{
 };
 use forkstack::integrations::{CommandRunner, ProcessRunner};
 use forkstack::ui::git::{
-    apply_move, apply_move_with_test_executable, checkout, reset_local_heads,
+    apply_move, apply_move_with_test_executable, checkout, load_graph_for, reset_local_heads,
 };
-use forkstack::ui::model::MovePlan;
+use forkstack::ui::model::{MoveMode, MovePlan};
 use serde_json::json;
 
 struct Fixture {
@@ -110,6 +110,29 @@ fn fetch_all(repo: &Path) {
         repo,
         &["fetch", "origin", "+refs/heads/*:refs/remotes/origin/*"],
     );
+}
+
+fn add_linear_forkstack_branches(fixture: &Fixture) -> (String, String) {
+    git(
+        &fixture.repo,
+        &["branch", "fs-head/draft/1", &fixture.first],
+    );
+    git(
+        &fixture.repo,
+        &["branch", "fs-head/draft/2", &fixture.second],
+    );
+    git(&fixture.repo, &["switch", "-c", "fs-head/rdma/2"]);
+    fs::write(fixture.repo.join("rdma-two"), "two\n").unwrap();
+    git(&fixture.repo, &["add", "rdma-two"]);
+    git(&fixture.repo, &["commit", "-m", "rdma two"]);
+    let rdma2 = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "-c", "fs-head/rdma/3"]);
+    fs::write(fixture.repo.join("rdma-three"), "three\n").unwrap();
+    git(&fixture.repo, &["add", "rdma-three"]);
+    git(&fixture.repo, &["commit", "-m", "rdma three"]);
+    let rdma3 = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["branch", "-f", "main", &fixture.base]);
+    (rdma2, rdma3)
 }
 
 #[test]
@@ -696,6 +719,115 @@ fn graph_reads_conflicted_paths_from_the_index() {
 }
 
 #[test]
+fn direct_substack_move_creates_a_parallel_tree() {
+    let fixture = fixture();
+    let (old_rdma2, old_rdma3) = add_linear_forkstack_branches(&fixture);
+    let graph = load_graph_for(&fixture.repo, "origin", "main").unwrap();
+    let plan = graph.plan_move(&old_rdma2, &fixture.base, true).unwrap();
+
+    apply_move_with_test_executable(
+        &fixture.repo,
+        &plan,
+        Path::new(env!("CARGO_BIN_EXE_forkstack")),
+    )
+    .unwrap();
+
+    let new_rdma2 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/2"]);
+    let new_rdma3 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/3"]);
+    assert_ne!(new_rdma2, old_rdma2);
+    assert_ne!(new_rdma3, old_rdma3);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/2^"]),
+        fixture.base
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3^"]),
+        new_rdma2
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/2"]),
+        fixture.second
+    );
+    assert_eq!(
+        git(&fixture.repo, &["branch", "--show-current"]),
+        "fs-head/rdma/3"
+    );
+}
+
+#[test]
+fn direct_single_commit_move_leaves_descendants_on_the_original_tree() {
+    let fixture = fixture();
+    let (old_rdma2, old_rdma3) = add_linear_forkstack_branches(&fixture);
+    let graph = load_graph_for(&fixture.repo, "origin", "main").unwrap();
+    let plan = graph.plan_move(&old_rdma2, &fixture.base, false).unwrap();
+
+    apply_move_with_test_executable(
+        &fixture.repo,
+        &plan,
+        Path::new(env!("CARGO_BIN_EXE_forkstack")),
+    )
+    .unwrap();
+
+    let new_rdma2 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/2"]);
+    assert_ne!(new_rdma2, old_rdma2);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/2^"]),
+        fixture.base
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3"]),
+        old_rdma3
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3^"]),
+        old_rdma2
+    );
+    assert_eq!(
+        git(&fixture.repo, &["branch", "--show-current"]),
+        "fs-head/rdma/2"
+    );
+}
+
+#[test]
+fn substack_reorder_replays_the_destination_tree_on_top() {
+    let fixture = fixture();
+    let (old_rdma2, _) = add_linear_forkstack_branches(&fixture);
+    let graph = load_graph_for(&fixture.repo, "origin", "main").unwrap();
+    let plan = graph.plan_reorder(&old_rdma2, &fixture.base, true).unwrap();
+
+    apply_move_with_test_executable(
+        &fixture.repo,
+        &plan,
+        Path::new(env!("CARGO_BIN_EXE_forkstack")),
+    )
+    .unwrap();
+
+    let new_rdma2 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/2"]);
+    let new_rdma3 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/3"]);
+    let new_draft1 = git(&fixture.repo, &["rev-parse", "fs-head/draft/1"]);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/2^"]),
+        fixture.base
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3^"]),
+        new_rdma2
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/1^"]),
+        new_rdma3
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/draft/2^"]),
+        new_draft1
+    );
+    assert_eq!(
+        git(&fixture.repo, &["branch", "--show-current"]),
+        "fs-head/draft/2"
+    );
+}
+
+#[test]
 fn checkout_lets_git_refuse_a_conflicting_dirty_switch_without_data_loss() {
     let fixture = fixture();
     git(
@@ -729,6 +861,7 @@ fn detached_apply_restores_branch_when_git_refuses_dirty_rebase() {
         base: fixture.base.clone(),
         source_base: fixture.base.clone(),
         carried_count: 2,
+        mode: MoveMode::Reorder,
         tip: "main".into(),
         tip_commit: fixture.second.clone(),
         detach_for_rewrite: true,
@@ -767,6 +900,7 @@ fn detached_apply_preserves_a_real_rebase_conflict() {
         base,
         source_base: fixture.second.clone(),
         carried_count: 2,
+        mode: MoveMode::Reorder,
         tip: "main".into(),
         tip_commit: second.clone(),
         detach_for_rewrite: true,
