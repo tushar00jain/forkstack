@@ -217,23 +217,29 @@ pub fn body_without_identity(body: &str) -> String {
     stripped.trim_end().to_owned()
 }
 
-fn remote_identities(
+fn known_identities(
     repo: &Repository,
     remote: &str,
     prefix: &str,
 ) -> Result<BTreeSet<String>, String> {
-    let root = format!("refs/remotes/{remote}/fs-head/{prefix}/");
-    let glob = format!("{root}*");
     let mut identities = BTreeSet::new();
-    for reference in repo
-        .references_glob(&glob)
-        .map_err(|error| error.message().to_owned())?
-    {
-        let reference = reference.map_err(|error| error.message().to_owned())?;
-        if let Some(name) = reference.name().and_then(|name| name.strip_prefix(&root)) {
-            identities.insert(format!("{prefix}/{name}"));
+
+    for root in [
+        format!("refs/heads/fs-head/{prefix}/"),
+        format!("refs/remotes/{remote}/fs-head/{prefix}/"),
+    ] {
+        let glob = format!("{root}*");
+        for reference in repo
+            .references_glob(&glob)
+            .map_err(|error| error.message().to_owned())?
+        {
+            let reference = reference.map_err(|error| error.message().to_owned())?;
+            if let Some(name) = reference.name().and_then(|name| name.strip_prefix(&root)) {
+                identities.insert(format!("{prefix}/{name}"));
+            }
         }
     }
+
     Ok(identities)
 }
 
@@ -283,32 +289,27 @@ fn assign_records(
         if !valid_branch_name(prefix) {
             return Err(format!("invalid identity prefix: {prefix}"));
         }
-        known.extend(remote_identities(repo, remote, prefix)?);
+        known.extend(known_identities(repo, remote, prefix)?);
+        let prefix_root = format!("{prefix}/");
         next_number = known
             .iter()
-            .filter_map(|branch| branch.strip_prefix(&format!("{prefix}/"))?.parse().ok())
+            .filter_map(|branch| branch.strip_prefix(&prefix_root)?.parse().ok())
             .max()
             .unwrap_or(0)
             + 1;
     }
     let mut result = Vec::new();
-    for (index, (record, existing)) in parsed.into_iter().enumerate() {
+    for (record, existing) in parsed {
         let identity_added = existing.is_none();
         let branch = if let Some(branch) = existing {
             branch
         } else {
             let prefix = prefix.unwrap();
-            let positional = format!("{prefix}/{}", index + 1);
-            let branch = if known.contains(&positional) && !claimed.contains(&positional) {
-                positional
-            } else {
-                while known.contains(&format!("{prefix}/{next_number}")) {
-                    next_number += 1;
-                }
-                let branch = format!("{prefix}/{next_number}");
+            while known.contains(&format!("{prefix}/{next_number}")) {
                 next_number += 1;
-                branch
-            };
+            }
+            let branch = format!("{prefix}/{next_number}");
+            next_number += 1;
             claimed.insert(branch.clone());
             known.insert(branch.clone());
             branch

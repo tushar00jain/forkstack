@@ -580,6 +580,39 @@ fn branch_assignment_reads_real_commit_history() {
 }
 
 #[test]
+fn branch_assignment_advances_past_local_and_remote_identities() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/heads/fs-head/draft/4", &fixture.base],
+    );
+    git(
+        &fixture.repo,
+        &[
+            "update-ref",
+            "refs/remotes/origin/fs-head/draft/7",
+            &fixture.base,
+        ],
+    );
+
+    let assigned = assign_branches(
+        &fixture.repo,
+        &[fixture.first.clone(), fixture.second.clone()],
+        "origin",
+        Some("draft"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        assigned
+            .iter()
+            .map(|step| step.branch.as_str())
+            .collect::<Vec<_>>(),
+        ["draft/8", "draft/9"]
+    );
+}
+
+#[test]
 fn tagged_stack_planning_uses_no_git_processes() {
     let fixture = fixture();
     let options = options(&fixture.repo);
@@ -1000,6 +1033,7 @@ fn identities_survive_a_real_reorder() {
 fn diverged_remote_base_keeps_each_stack_heads_actual_parent() {
     let fixture = fixture();
     let advanced = advance_remote_main(&fixture);
+    let plan = plan(options(&fixture.repo)).unwrap();
     for branch in [
         "fs-base/draft/1",
         "fs-head/draft/1",
@@ -1016,7 +1050,6 @@ fn diverged_remote_base_keeps_each_stack_heads_actual_parent() {
         );
     }
 
-    let plan = plan(options(&fixture.repo)).unwrap();
     assert_eq!(plan.base_ref, "origin/main");
     assert_eq!(plan.commits[0].rev, fixture.first);
     assert_eq!(plan.commits[1].rev, fixture.second);
@@ -1075,6 +1108,7 @@ fn divergent_local_head_is_not_overwritten() {
         &["branch", "fs-head/draft/1", &fixture.second],
     );
     let mut submit = plan(options(&fixture.repo)).unwrap();
+    submit.commits[0].branch = "draft/1".into();
     submit.commits.truncate(1);
     submit.commits[0].identity_added = false;
     assert!(
@@ -1182,6 +1216,7 @@ fn head_checked_out_in_another_worktree_is_not_overwritten() {
     );
 
     let mut submit = plan(options(&fixture.repo)).unwrap();
+    submit.commits[0].branch = "draft/1".into();
     submit.commits.truncate(1);
     submit.commits[0].identity_added = false;
     let error = test_support::sync_local_heads(&submit).unwrap_err();
