@@ -55,16 +55,13 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
 
 fn is_graph_root_ref(
     name: &str,
-    local_base: &str,
     remote_base: &str,
     remote_head_prefix: &str,
     remote_base_prefix: &str,
     upstream_base: &str,
     upstream_head_prefix: &str,
 ) -> bool {
-    name == local_base
-        || name.starts_with("refs/heads/fs-head/")
-        || name.starts_with("refs/heads/fs-base/")
+    name.starts_with("refs/heads/")
         || name == remote_base
         || name.starts_with(remote_head_prefix)
         || name.starts_with(remote_base_prefix)
@@ -144,7 +141,6 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     if let Some(name) = head_ref.name() {
         refs.push((head_oid, name.to_owned()));
     }
-    let local_base = format!("refs/heads/{base}");
     let remote_base = format!("refs/remotes/{remote}/{base}");
     let remote_head_prefix = format!("refs/remotes/{remote}/fs-head/");
     let remote_base_prefix = format!("refs/remotes/{remote}/fs-base/");
@@ -161,7 +157,6 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
         };
         let is_root = is_graph_root_ref(
             name,
-            &local_base,
             &remote_base,
             &remote_head_prefix,
             &remote_base_prefix,
@@ -680,8 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn graph_roots_are_limited_to_forkstack_and_configured_base_refs() {
-        let local_base = "refs/heads/trunk";
+    fn graph_roots_include_all_local_branches_and_selected_remote_refs() {
         let remote_base = "refs/remotes/origin/trunk";
         let remote_head_prefix = "refs/remotes/origin/fs-head/";
         let remote_base_prefix = "refs/remotes/origin/fs-base/";
@@ -691,6 +685,7 @@ mod tests {
             "refs/heads/fs-head/topic/1",
             "refs/heads/fs-base/topic/1",
             "refs/heads/trunk",
+            "refs/heads/unrelated",
             "refs/remotes/origin/fs-head/topic/1",
             "refs/remotes/origin/fs-base/topic/1",
             "refs/remotes/origin/trunk",
@@ -700,7 +695,6 @@ mod tests {
             assert!(
                 is_graph_root_ref(
                     name,
-                    local_base,
                     remote_base,
                     remote_head_prefix,
                     remote_base_prefix,
@@ -711,7 +705,6 @@ mod tests {
             );
         }
         for name in [
-            "refs/heads/unrelated",
             "refs/remotes/upstream/fs-base/topic/1",
             "refs/remotes/upstream/unrelated",
             "refs/tags/v1",
@@ -719,7 +712,6 @@ mod tests {
             assert!(
                 !is_graph_root_ref(
                     name,
-                    local_base,
                     remote_base,
                     remote_head_prefix,
                     remote_base_prefix,

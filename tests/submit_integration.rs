@@ -592,7 +592,7 @@ fn planning_process_count_is_independent_of_small_stack_size() {
 }
 
 #[test]
-fn graph_does_not_walk_unrelated_branch_history() {
+fn graph_walks_all_local_branch_history() {
     let fixture = fixture();
     git(&fixture.repo, &["switch", "--orphan", "unrelated"]);
     git(
@@ -625,7 +625,17 @@ fn graph_does_not_walk_unrelated_branch_history() {
     );
 
     let graph = forkstack::ui::git::load_graph_for(&fixture.repo, "origin", "main").unwrap();
-    assert!(!graph.commits.contains_key(&unrelated));
+    assert!(graph.commits.contains_key(&unrelated));
+    assert!(
+        graph.commits[&unrelated]
+            .local_refs
+            .contains(&"unrelated".into())
+    );
+    assert!(
+        graph.commits[&unrelated]
+            .tags
+            .contains(&"unrelated-tag".into())
+    );
     assert!(graph.commits.contains_key(&fixture.second));
     assert!(graph.commits.contains_key(&fixture.base));
     assert!(
