@@ -53,20 +53,17 @@ pub fn load_graph(repo: &Path) -> Result<Graph, String> {
     load_graph_for(repo, "origin", "main")
 }
 
-fn is_graph_root_ref(
-    name: &str,
-    remote_base: &str,
-    remote_head_prefix: &str,
-    remote_base_prefix: &str,
-    upstream_base: &str,
-    upstream_head_prefix: &str,
-) -> bool {
-    name.starts_with("refs/heads/")
-        || name == remote_base
-        || name.starts_with(remote_head_prefix)
-        || name.starts_with(remote_base_prefix)
-        || name == upstream_base
-        || name.starts_with(upstream_head_prefix)
+fn is_graph_root_ref(name: &str, base: &str, remotes: &BTreeSet<&str>) -> bool {
+    let is_visible_remote_ref = name
+        .strip_prefix("refs/remotes/")
+        .and_then(|name| name.split_once('/'))
+        .is_some_and(|(remote, branch)| {
+            remotes.contains(remote)
+                && (branch == base
+                    || branch.starts_with("fs-head/")
+                    || branch.starts_with("fs-base/"))
+        });
+    name.starts_with("refs/heads/") || is_visible_remote_ref
 }
 
 fn conflict_paths(repository: &Repository) -> Result<Vec<String>, String> {
@@ -141,11 +138,7 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     if let Some(name) = head_ref.name() {
         refs.push((head_oid, name.to_owned()));
     }
-    let remote_base = format!("refs/remotes/{remote}/{base}");
-    let remote_head_prefix = format!("refs/remotes/{remote}/fs-head/");
-    let remote_base_prefix = format!("refs/remotes/{remote}/fs-base/");
-    let upstream_base = format!("refs/remotes/upstream/{base}");
-    let upstream_head_prefix = "refs/remotes/upstream/fs-head/";
+    let visible_remotes = BTreeSet::from(["origin", "upstream", remote]);
     let mut tags = Vec::new();
     for reference in repository
         .references()
@@ -155,14 +148,7 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
         let Some(name) = reference.name() else {
             continue;
         };
-        let is_root = is_graph_root_ref(
-            name,
-            &remote_base,
-            &remote_head_prefix,
-            &remote_base_prefix,
-            &upstream_base,
-            upstream_head_prefix,
-        );
+        let is_root = is_graph_root_ref(name, base, &visible_remotes);
         let is_tag = name.starts_with("refs/tags/");
         if !is_root && !is_tag {
             continue;
@@ -676,12 +662,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_roots_include_all_local_branches_and_selected_remote_refs() {
-        let remote_base = "refs/remotes/origin/trunk";
-        let remote_head_prefix = "refs/remotes/origin/fs-head/";
-        let remote_base_prefix = "refs/remotes/origin/fs-base/";
-        let upstream_base = "refs/remotes/upstream/trunk";
-        let upstream_head_prefix = "refs/remotes/upstream/fs-head/";
+    fn graph_roots_include_all_local_branches_and_visible_remote_refs() {
+        let remotes = BTreeSet::from(["origin", "upstream"]);
         for name in [
             "refs/heads/fs-head/topic/1",
             "refs/heads/fs-base/topic/1",
@@ -691,36 +673,17 @@ mod tests {
             "refs/remotes/origin/fs-base/topic/1",
             "refs/remotes/origin/trunk",
             "refs/remotes/upstream/fs-head/topic/1",
+            "refs/remotes/upstream/fs-base/topic/1",
             "refs/remotes/upstream/trunk",
         ] {
-            assert!(
-                is_graph_root_ref(
-                    name,
-                    remote_base,
-                    remote_head_prefix,
-                    remote_base_prefix,
-                    upstream_base,
-                    upstream_head_prefix,
-                ),
-                "{name}"
-            );
+            assert!(is_graph_root_ref(name, "trunk", &remotes), "{name}");
         }
         for name in [
-            "refs/remotes/upstream/fs-base/topic/1",
+            "refs/remotes/other/fs-base/topic/1",
             "refs/remotes/upstream/unrelated",
             "refs/tags/v1",
         ] {
-            assert!(
-                !is_graph_root_ref(
-                    name,
-                    remote_base,
-                    remote_head_prefix,
-                    remote_base_prefix,
-                    upstream_base,
-                    upstream_head_prefix,
-                ),
-                "{name}"
-            );
+            assert!(!is_graph_root_ref(name, "trunk", &remotes), "{name}");
         }
     }
 

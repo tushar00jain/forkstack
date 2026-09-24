@@ -45,6 +45,7 @@ pub struct CreatePullRequest<'a> {
 pub struct EditPullRequest<'a> {
     pub id: &'a str,
     pub body: &'a str,
+    pub base: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -291,8 +292,12 @@ pub fn edit_prs(
         .iter()
         .enumerate()
         .map(|(index, request)| {
+            let base = request
+                .base
+                .map(|base| format!(",baseRefName:{}", graphql_string(base)))
+                .unwrap_or_default();
             format!(
-                "p{index}:updatePullRequest(input:{{pullRequestId:{},body:{}}}){{pullRequest{{id number baseRefName headRefName body isDraft url}}}}",
+                "p{index}:updatePullRequest(input:{{pullRequestId:{},body:{}{base}}}){{pullRequest{{id number baseRefName headRefName body isDraft url}}}}",
                 graphql_string(request.id),
                 graphql_string(request.body),
             )
@@ -447,6 +452,7 @@ mod tests {
             &[EditPullRequest {
                 id: "PR_one",
                 body: "new body",
+                base: None,
             }],
         )
         .unwrap();
@@ -455,7 +461,41 @@ mod tests {
         let request: serde_json::Value = serde_json::from_str(&input).unwrap();
         let query = request["query"].as_str().unwrap();
         assert!(query.contains("pullRequestId:\"PR_one\",body:\"new body\""));
+        assert!(!query.contains("baseRefName:\""));
         assert!(!query.contains("title"));
+    }
+
+    #[test]
+    fn edit_can_update_the_pull_request_base() {
+        let runner = Runner {
+            output: serde_json::json!({
+                "data": {"p0": {"pullRequest": {
+                    "id": "PR_one", "number": 1,
+                    "baseRefName": "main", "headRefName": "topic",
+                    "title": "title", "body": "body",
+                    "isDraft": true, "url": "https://example.invalid/1"
+                }}}
+            })
+            .to_string(),
+            calls: Mutex::new(Vec::new()),
+            inputs: Mutex::new(Vec::new()),
+        };
+
+        edit_prs(
+            &runner,
+            Path::new("."),
+            &[EditPullRequest {
+                id: "PR_one",
+                body: "body",
+                base: Some("main"),
+            }],
+        )
+        .unwrap();
+
+        let input = runner.inputs.lock().unwrap()[0].clone();
+        let request: serde_json::Value = serde_json::from_str(&input).unwrap();
+        let query = request["query"].as_str().unwrap();
+        assert!(query.contains("baseRefName:\"main\""), "{query}");
     }
 
     #[test]
@@ -471,6 +511,7 @@ mod tests {
             &[EditPullRequest {
                 id: "PR_one",
                 body: "body",
+                base: None,
             }],
         )
         .unwrap_err();
@@ -494,6 +535,7 @@ mod tests {
             &[EditPullRequest {
                 id: "PR_one",
                 body: "body",
+                base: None,
             }],
         )
         .unwrap_err();

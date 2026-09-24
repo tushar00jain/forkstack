@@ -891,32 +891,45 @@ fn execute_with_links(
         .enumerate()
         .filter_map(|(index, _)| {
             let pr = prs[index].as_ref()?;
-            (pr.body != desired_bodies[index]).then_some(integrations::github::EditPullRequest {
-                id: &pr.id,
-                body: &desired_bodies[index],
-            })
+            let base = (plan.commits.len() == 1 && pr.base_ref_name != plan.options.base)
+                .then_some(plan.options.base.as_str());
+            (pr.body != desired_bodies[index] || base.is_some()).then_some(
+                integrations::github::EditPullRequest {
+                    id: &pr.id,
+                    body: &desired_bodies[index],
+                    base,
+                },
+            )
         })
         .collect();
     integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
-    report("linking pull requests into a GitHub stack");
-    let desired_pull_requests: Vec<_> = prs.iter().map(|pr| pr.as_ref().unwrap().number).collect();
-    let existing_pull_requests: Vec<_> = desired_pull_requests
-        .iter()
-        .zip(&was_existing)
-        .filter_map(|(number, existed)| existed.then_some(*number))
-        .collect();
-    integrations::gh_stack::reconcile_and_link(
-        runner,
-        &plan.options.repo,
-        &plan.fork,
-        &plan.options.remote,
-        &plan.options.base,
-        &heads,
-        integrations::gh_stack::PullRequestMembership {
-            existing: &existing_pull_requests,
-            desired: &desired_pull_requests,
-        },
-    )?;
+    if plan.commits.len() == 1 {
+        report(&format!(
+            "single pull request targets {}; skipping GitHub stack link",
+            plan.options.base
+        ));
+    } else {
+        report("linking pull requests into a GitHub stack");
+        let desired_pull_requests: Vec<_> =
+            prs.iter().map(|pr| pr.as_ref().unwrap().number).collect();
+        let existing_pull_requests: Vec<_> = desired_pull_requests
+            .iter()
+            .zip(&was_existing)
+            .filter_map(|(number, existed)| existed.then_some(*number))
+            .collect();
+        integrations::gh_stack::reconcile_and_link(
+            runner,
+            &plan.options.repo,
+            &plan.fork,
+            &plan.options.remote,
+            &plan.options.base,
+            &heads,
+            integrations::gh_stack::PullRequestMembership {
+                existing: &existing_pull_requests,
+                desired: &desired_pull_requests,
+            },
+        )?;
+    }
     report(&format!(
         "\n{} pull requests in {}.",
         plan.commits.len(),
@@ -987,7 +1000,14 @@ pub fn print_plan(plan: &SubmitPlan) {
             step.head_branch()
         );
     }
-    println!("\n  link the pull requests into a GitHub stack");
+    if plan.commits.len() == 1 {
+        println!(
+            "\n  ensure the pull request targets {} (GitHub stacks require at least two PRs)",
+            plan.options.base
+        );
+    } else {
+        println!("\n  link the pull requests into a GitHub stack");
+    }
     println!("\nRe-run with --execute to do it.");
 }
 

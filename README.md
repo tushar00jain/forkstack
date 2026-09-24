@@ -35,6 +35,11 @@ forkstack log --remote origin,upstream
 forkstack log --no-remotes -n 20
 ```
 
+The UI always displays Forkstack refs from `origin` and `upstream`. Its
+single-valued `--remote` option selects the default remote used by publish and
+reset operations; it is not a graph visibility filter. The `log` command uses
+`--remote origin,upstream` when both sets of remote refs should be displayed.
+
 ### UI keys
 
 | Key | Action |

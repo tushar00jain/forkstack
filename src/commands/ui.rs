@@ -12,7 +12,11 @@ pub struct UiArgs {
         help = "repository or parent directory to scan one level down (default: cwd)"
     )]
     pub repo: PathBuf,
-    #[arg(long, default_value = "origin", help = "remote for your fork")]
+    #[arg(
+        long,
+        default_value = "origin",
+        help = "default remote for publish and reset operations"
+    )]
     pub remote: String,
     #[arg(
         long,

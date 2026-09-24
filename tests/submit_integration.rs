@@ -504,6 +504,8 @@ impl CommandRunner for FakeRunner {
             state.events.push("gh:edit".into());
             let ids = graphql_values(&query, "pullRequestId:");
             let bodies = graphql_values(&query, "body:");
+            let bases = graphql_values(&query, "baseRefName:");
+            assert!(bases.is_empty() || bases.len() == ids.len());
             let mut data = serde_json::Map::new();
             for index in 0..ids.len() {
                 let (head, pr) = state
@@ -512,6 +514,9 @@ impl CommandRunner for FakeRunner {
                     .find(|(_, pr)| format!("PR_{}", pr.number) == ids[index])
                     .unwrap();
                 pr.body = bodies[index].clone();
+                if let Some(base) = bases.get(index) {
+                    pr.base = base.clone();
+                }
                 data.insert(
                     format!("p{index}"),
                     json!({"pullRequest": fake_pr_json(pr, head)}),
@@ -710,7 +715,7 @@ fn graph_walks_all_local_branch_history() {
             .contains(&"upstream/main".into())
     );
     assert!(
-        !graph.commits[&fixture.second]
+        graph.commits[&fixture.second]
             .remote_refs
             .contains(&"upstream/fs-base/ignored".into())
     );
@@ -1254,6 +1259,36 @@ fn existing_pr_with_a_different_base_is_relinked() {
             .starts_with("manual description\n\n<!-- forkstack:stack:start -->")
     );
     assert_eq!(state.events.last().map(String::as_str), Some("gh:link"));
+}
+
+#[test]
+fn single_pull_request_targets_base_without_calling_gh_stack_link() {
+    let fixture = fixture();
+    git(&fixture.repo, &["switch", "--detach", &fixture.first]);
+    let runner = FakeRunner::default();
+    runner.state.lock().unwrap().prs.insert(
+        "fs-head/draft/1".into(),
+        FakePr {
+            number: 101,
+            base: "fs-base/draft/1".into(),
+            title: "manually edited title".into(),
+            body: "manual description".into(),
+            draft: true,
+        },
+    );
+
+    let mut submit = plan(options(&fixture.repo)).unwrap();
+    assert_eq!(submit.commits.len(), 1);
+    execute_with(&mut submit, &runner, &mut |_| {}).unwrap();
+
+    let state = runner.state.lock().unwrap();
+    assert_eq!(state.prs["fs-head/draft/1"].base, "main");
+    assert_eq!(state.prs["fs-head/draft/1"].title, "manually edited title");
+    assert_eq!(
+        state.events,
+        ["gh:discover", "git:push", "gh:edit"],
+        "a single pull request is not a GitHub stack"
+    );
 }
 
 #[test]
