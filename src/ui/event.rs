@@ -11,10 +11,10 @@ use crossterm::event::{self, Event};
 use crate::core::submit::{SubmitOptions, SubmitPlan};
 use crate::integrations::github::PullRequestLink;
 use crate::ui::git::{
-    apply_move, checkout, displayed_remote_heads, load_graph_for, load_pr_links, remote_pr_links,
-    reset_local_heads,
+    apply_move, checkout, delete_forkstack_branch, displayed_remote_heads, load_graph_for,
+    load_pr_links, remote_pr_links, reset_local_heads,
 };
-use crate::ui::model::{Graph, MovePlan};
+use crate::ui::model::{DeleteBranchPlan, Graph, MovePlan};
 
 #[derive(Debug)]
 pub(crate) enum Operation {
@@ -26,6 +26,7 @@ pub(crate) enum Operation {
     },
     Apply(MovePlan),
     ResetLocalHeads,
+    DeleteBranch(DeleteBranchPlan),
     PublishPreview(SubmitOptions),
     PublishExecute(SubmitPlan),
     Stop,
@@ -151,6 +152,13 @@ fn operation_worker(operations: Receiver<OperationRequest>, events: Sender<UiEve
             }
             Operation::Apply(plan) => apply_move(&repo, &plan).err(),
             Operation::ResetLocalHeads => match reset_local_heads(&repo, &options.remote) {
+                Ok(status) => {
+                    operation_status = Some(status);
+                    None
+                }
+                Err(error) => Some(error),
+            },
+            Operation::DeleteBranch(plan) => match delete_forkstack_branch(&repo, &plan) {
                 Ok(status) => {
                     operation_status = Some(status);
                     None

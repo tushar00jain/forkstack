@@ -7,9 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use git2::{Oid, Repository, RepositoryState, Sort};
 
-use crate::integrations::ProcessRunner;
+use crate::integrations::git::delete_remote_branches;
 use crate::integrations::github::{PullRequestLink, discover_pr_links};
-use crate::ui::model::{Commit, Graph, MoveMode, MovePlan};
+use crate::integrations::{CommandRunner, ProcessRunner};
+use crate::ui::model::{Commit, DeleteBranchPlan, Graph, MoveMode, MovePlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
@@ -387,6 +388,96 @@ pub fn reset_local_heads(repo: &Path, remote: &str) -> Result<String, String> {
     Ok(status)
 }
 
+pub fn delete_forkstack_branch(repo: &Path, plan: &DeleteBranchPlan) -> Result<String, String> {
+    delete_forkstack_branch_with(repo, plan, &ProcessRunner)
+}
+
+fn delete_forkstack_branch_with(
+    repo: &Path,
+    plan: &DeleteBranchPlan,
+    runner: &dyn CommandRunner,
+) -> Result<String, String> {
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    if repository.state() != RepositoryState::Clean {
+        return Err("cannot delete branches while a Git operation is in progress".into());
+    }
+    if !run(repo, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+        return Err("cannot delete branches with uncommitted tracked changes".into());
+    }
+
+    let head = repository
+        .head()
+        .map_err(|error| error.message().to_owned())?;
+    if head.shorthand() != Some(&plan.branch) {
+        return Err("checked-out branch changed after the deletion preview".into());
+    }
+    let actual_head = head
+        .peel_to_commit()
+        .map_err(|error| error.message().to_owned())?
+        .id()
+        .to_string();
+    if actual_head != plan.expected_head {
+        return Err("checked-out branch moved after the deletion preview".into());
+    }
+    let checkout = repository
+        .find_branch(&plan.checkout_branch, git2::BranchType::Local)
+        .map_err(|_| {
+            format!(
+                "local base branch {:?} no longer exists",
+                plan.checkout_branch
+            )
+        })?;
+    let actual_checkout = checkout
+        .get()
+        .peel_to_commit()
+        .map_err(|error| error.message().to_owned())?
+        .id()
+        .to_string();
+    if actual_checkout != plan.expected_checkout {
+        return Err("local base branch moved after the deletion preview".into());
+    }
+    let configured_remotes: BTreeSet<_> = repository
+        .remotes()
+        .map_err(|error| error.message().to_owned())?
+        .iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect();
+    drop(checkout);
+    drop(head);
+    drop(repository);
+
+    run(repo, &["switch", &plan.checkout_branch])?;
+
+    let mut num_remote_branches = 0;
+    for remote in ["origin", "upstream"] {
+        let branches: Vec<_> = plan
+            .remote_branches
+            .iter()
+            .filter(|(candidate, _)| candidate == remote)
+            .map(|(_, branch)| branch.clone())
+            .collect();
+        if configured_remotes.contains(remote) {
+            num_remote_branches +=
+                delete_remote_branches(runner, repo, remote, branches.iter().cloned())?;
+        }
+        crate::integrations::git::delete_refs(
+            repo,
+            &branches
+                .iter()
+                .map(|branch| format!("refs/remotes/{remote}/{branch}"))
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    run(repo, &["branch", "-D", &plan.branch])?;
+
+    Ok(format!(
+        "deleted {} locally and {num_remote_branches} remote branch{}",
+        plan.branch,
+        if num_remote_branches == 1 { "" } else { "es" }
+    ))
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -730,6 +821,102 @@ mod tests {
                 .all(|commit| commit.conflict.is_none())
         );
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn deletes_checked_out_forkstack_branch_locally_and_from_both_remotes() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "forkstack-delete-branch-{}-{stamp}",
+            std::process::id()
+        ));
+        let repo = root.join("repo");
+        let origin = root.join("origin.git");
+        let upstream = root.join("upstream.git");
+        fs::create_dir_all(&root).unwrap();
+        run(&root, &["init", "--bare", origin.to_str().unwrap()]).unwrap();
+        run(&root, &["init", "--bare", upstream.to_str().unwrap()]).unwrap();
+        run(&root, &["init", "-b", "main", repo.to_str().unwrap()]).unwrap();
+        run(&repo, &["config", "user.name", "ForkStack Test"]).unwrap();
+        run(
+            &repo,
+            &["config", "user.email", "forkstack@example.invalid"],
+        )
+        .unwrap();
+        fs::write(repo.join("base"), "base\n").unwrap();
+        run(&repo, &["add", "base"]).unwrap();
+        run(&repo, &["commit", "-m", "base"]).unwrap();
+        let base = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+        run(&repo, &["switch", "-c", "fs-head/topic/1"]).unwrap();
+        fs::write(repo.join("change"), "change\n").unwrap();
+        run(&repo, &["add", "change"]).unwrap();
+        run(&repo, &["commit", "-m", "change"]).unwrap();
+        let head = run(&repo, &["rev-parse", "HEAD"]).unwrap();
+        for (remote, path) in [("origin", &origin), ("upstream", &upstream)] {
+            run(&repo, &["remote", "add", remote, path.to_str().unwrap()]).unwrap();
+            run(
+                &repo,
+                &[
+                    "push",
+                    remote,
+                    &format!("{head}:refs/heads/fs-head/topic/1"),
+                    &format!("{base}:refs/heads/fs-base/topic/1"),
+                ],
+            )
+            .unwrap();
+        }
+
+        let status = delete_forkstack_branch(
+            &repo,
+            &DeleteBranchPlan {
+                branch: "fs-head/topic/1".into(),
+                expected_head: head,
+                checkout_branch: "main".into(),
+                expected_checkout: base,
+                remote_branches: ["origin", "upstream"]
+                    .into_iter()
+                    .flat_map(|remote| {
+                        ["fs-head/topic/1", "fs-base/topic/1"]
+                            .into_iter()
+                            .map(move |branch| (remote.into(), branch.into()))
+                    })
+                    .collect(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            status,
+            "deleted fs-head/topic/1 locally and 4 remote branches"
+        );
+        assert_eq!(run(&repo, &["branch", "--show-current"]).unwrap(), "main");
+        assert!(
+            run(
+                &repo,
+                &["show-ref", "--verify", "refs/heads/fs-head/topic/1"]
+            )
+            .is_err()
+        );
+        for remote in ["origin", "upstream"] {
+            assert!(
+                run(
+                    &repo,
+                    &[
+                        "ls-remote",
+                        "--heads",
+                        remote,
+                        "refs/heads/fs-head/topic/1",
+                        "refs/heads/fs-base/topic/1",
+                    ],
+                )
+                .unwrap()
+                .is_empty()
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

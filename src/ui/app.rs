@@ -22,7 +22,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::core::submit::{SubmitOptions, SubmitPlan};
 use crate::integrations::github::PullRequestLink;
 use crate::ui::event::{self, Operation, OperationRequest, OperationResult, UiEvent};
-use crate::ui::model::{Graph, MoveMode, MovePlan};
+use crate::ui::model::{DeleteBranchPlan, Graph, MoveMode, MovePlan};
 use crate::ui::render::{RenderedLine, TextKind, attach_pr_links, commit_label, render_graph};
 use crate::ui::workspace::{self, Workspace};
 
@@ -122,6 +122,7 @@ fn help_lines() -> Vec<Line<'static>> {
     vec![
         help_line("m/M", "move exact commit / substack"),
         help_line("z/Z", "reorder commit / substack"),
+        help_line("d", "preview deleting the checked-out ForkStack branch"),
         help_line("l", "preview local reset to origin"),
         help_line("o", "preview origin publish and stack link"),
         help_line("u", "preview upstream publish and stack link"),
@@ -238,6 +239,7 @@ struct RepositoryState {
     carry_substack: bool,
     move_mode: MoveMode,
     pending: Option<MovePlan>,
+    delete_plan: Option<DeleteBranchPlan>,
     reset_local_pending: bool,
     publish_plan: Option<SubmitPlan>,
     search: Search,
@@ -322,6 +324,7 @@ impl RepositoryState {
                     self.carried = None;
                     self.carried_commits.clear();
                     self.pending = None;
+                    self.delete_plan = None;
                     self.reset_local_pending = false;
                     self.publish_plan = None;
                 }
@@ -589,6 +592,7 @@ impl App {
         self.state.discard_preview = true;
         let had_preview = self.state.preview.take().is_some();
         self.state.pending = None;
+        self.state.delete_plan = None;
         self.state.reset_local_pending = false;
         self.state.publish_plan = None;
         if !keep_carried {
@@ -637,7 +641,9 @@ impl App {
 
     fn move_cursor(&mut self, amount: isize) {
         if !preserve_preview_while_navigating(
-            self.state.publish_plan.is_some() || self.state.reset_local_pending,
+            self.state.publish_plan.is_some()
+                || self.state.delete_plan.is_some()
+                || self.state.reset_local_pending,
         ) {
             self.clear_preview(true);
         }
@@ -691,6 +697,16 @@ impl App {
         }
         if self.state.publish_plan.is_some() {
             self.execute_publish();
+            return;
+        }
+        if let Some(plan) = self.state.delete_plan.clone() {
+            if self.start_operation(
+                Operation::DeleteBranch(plan),
+                Busy::Mutation,
+                "deleting ForkStack branches…",
+            ) {
+                self.state.delete_plan = None;
+            }
             return;
         }
         if self.state.reset_local_pending {
@@ -818,6 +834,39 @@ impl App {
         self.dirty = true;
     }
 
+    fn preview_delete_branch(&mut self) {
+        if self.state.busy.is_some() {
+            self.reject_busy_operation();
+            return;
+        }
+        self.clear_preview(false);
+        let Some(graph) = self.state.graph.as_ref() else {
+            return;
+        };
+        match graph
+            .plan_delete_current_branch(&self.publish_options.base)
+            .and_then(|plan| {
+                let preview = graph.delete_branch_preview(&plan)?;
+                Ok((plan, preview))
+            }) {
+            Ok((plan, preview)) => {
+                self.state.status = Some(format!(
+                    "previewing deletion of {} locally and its origin/upstream head/base branches; press Enter to confirm",
+                    plan.branch
+                ));
+                self.state.delete_plan = Some(plan);
+                self.state.preview = Some(preview);
+                self.state.status_error = false;
+                self.update_rendered();
+            }
+            Err(error) => {
+                self.state.status = Some(error);
+                self.state.status_error = true;
+                self.dirty = true;
+            }
+        }
+    }
+
     fn execute_publish(&mut self) {
         let Some(plan) = self.state.publish_plan.clone() else {
             self.state.status = Some("press o or u to preview publish changes first".into());
@@ -943,7 +992,8 @@ impl App {
         if self.state.busy.is_some()
             && matches!(
                 key.code,
-                KeyCode::Enter | KeyCode::Char('l' | 'm' | 'M' | 'z' | 'Z' | 'o' | 'r' | 'u' | 'q')
+                KeyCode::Enter
+                    | KeyCode::Char('d' | 'l' | 'm' | 'M' | 'z' | 'Z' | 'o' | 'r' | 'u' | 'q')
             )
         {
             self.reject_busy_operation();
@@ -957,6 +1007,7 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
+            (KeyCode::Char('d'), _) => self.preview_delete_branch(),
             (KeyCode::Char('l'), _) => self.preview_local_reset(),
             (KeyCode::Char('o'), _) => self.preview_publish(self.publish_options.remote.clone()),
             (KeyCode::Char('u'), _) => self.preview_publish("upstream".into()),
@@ -1637,10 +1688,11 @@ mod tests {
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
-        assert_eq!(help.len(), 8);
+        assert_eq!(help.len(), 9);
         for binding in [
             "m/M          move exact commit / substack",
             "z/Z          reorder commit / substack",
+            "d            preview deleting the checked-out ForkStack branch",
             "l            preview local reset to origin",
             "o            preview origin publish and stack link",
             "u            preview upstream publish and stack link",
@@ -1715,6 +1767,53 @@ mod tests {
         assert!(matches!(
             operations.recv().unwrap().operation,
             Operation::ResetLocalHeads
+        ));
+        assert_eq!(app.state.busy, Some(Busy::Mutation));
+    }
+
+    #[test]
+    fn delete_key_previews_and_enter_confirms_branch_deletion() {
+        let (mut app, operations, _events) = test_app();
+        app.state.graph = Some(Graph {
+            commits: [
+                (
+                    "head".into(),
+                    crate::ui::model::Commit {
+                        id: "head".into(),
+                        local_refs: vec!["fs-head/topic/1".into()],
+                        is_head: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "base".into(),
+                    crate::ui::model::Commit {
+                        id: "base".into(),
+                        local_refs: vec!["main".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            order: vec!["head".into(), "base".into()],
+            head: "head".into(),
+            branch: Some("fs-head/topic/1".into()),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert!(operations.try_recv().is_err());
+        assert!(app.state.delete_plan.is_some());
+        assert!(app.state.preview.is_some());
+        assert_eq!(
+            app.state.preview.as_ref().unwrap().branch.as_deref(),
+            Some("main")
+        );
+
+        app.enter();
+        assert!(matches!(
+            operations.recv().unwrap().operation,
+            Operation::DeleteBranch(_)
         ));
         assert_eq!(app.state.busy, Some(Busy::Mutation));
     }
@@ -2020,6 +2119,7 @@ mod tests {
             KeyCode::Char('z'),
             KeyCode::Char('Z'),
             KeyCode::Enter,
+            KeyCode::Char('d'),
             KeyCode::Char('l'),
             KeyCode::Char('o'),
             KeyCode::Char('r'),

@@ -269,6 +269,66 @@ pub fn push_atomic(
     run_owned(runner, repo, &args).map(|_| ())
 }
 
+pub fn delete_remote_branches(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    remote: &str,
+    branches: impl IntoIterator<Item = String>,
+) -> Result<usize, String> {
+    let branches: Vec<_> = branches
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if branches.is_empty() {
+        return Ok(0);
+    }
+
+    let mut ls_args = vec![
+        "ls-remote".into(),
+        "--refs".into(),
+        "--heads".into(),
+        "--end-of-options".into(),
+        remote.into(),
+    ];
+    ls_args.extend(branches.iter().map(|branch| format!("refs/heads/{branch}")));
+    let advertised: BTreeMap<_, _> = run_owned(runner, repo, &ls_args)?
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+        })
+        .map(|(oid, reference)| (reference, oid))
+        .collect();
+    let existing: Vec<_> = branches
+        .iter()
+        .filter_map(|branch| {
+            let reference = format!("refs/heads/{branch}");
+            advertised
+                .get(&reference)
+                .map(|oid| (branch, reference, oid))
+        })
+        .collect();
+    if existing.is_empty() {
+        return Ok(0);
+    }
+
+    let mut push_args = vec!["push".into(), "--atomic".into()];
+    push_args.extend(
+        existing
+            .iter()
+            .map(|(_, reference, oid)| format!("--force-with-lease={reference}:{oid}")),
+    );
+    push_args.push(remote.into());
+    push_args.extend(
+        existing
+            .iter()
+            .map(|(_, reference, _)| format!(":{reference}")),
+    );
+    run_owned(runner, repo, &push_args)?;
+    Ok(existing.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +426,44 @@ mod tests {
             ]
         );
         assert_eq!(missing, ["refs/remotes/upstream/fs-base/topic/1"]);
+    }
+
+    #[test]
+    fn remote_branch_deletion_uses_atomic_explicit_leases() {
+        let runner = Runner::default();
+
+        let deleted = delete_remote_branches(
+            &runner,
+            Path::new("."),
+            "upstream",
+            ["fs-head/topic/1".into(), "fs-base/topic/1".into()],
+        )
+        .unwrap();
+
+        assert_eq!(deleted, 1);
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(
+            calls[0].0,
+            [
+                "ls-remote",
+                "--refs",
+                "--heads",
+                "--end-of-options",
+                "upstream",
+                "refs/heads/fs-base/topic/1",
+                "refs/heads/fs-head/topic/1",
+            ]
+        );
+        assert_eq!(
+            calls[1].0,
+            [
+                "push",
+                "--atomic",
+                "--force-with-lease=refs/heads/fs-head/topic/1:aaaa",
+                "upstream",
+                ":refs/heads/fs-head/topic/1",
+            ]
+        );
     }
 
     #[test]

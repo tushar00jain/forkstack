@@ -49,6 +49,7 @@ reset operations; it is not a graph visibility filter. The `log` command uses
 | `Enter` | Activate a repository; in the graph, check out or confirm a preview |
 | `m` / `M` | Move exactly one commit / a substack onto a destination |
 | `z` / `Z` | Reorder one commit / a substack while preserving destination descendants |
+| `d` | Preview deleting the checked-out `fs-head/*` branch and its origin/upstream head/base branches |
 | `l` | Preview resetting local `fs-head/*` branches to fetched `origin/*` refs |
 | `o` | Preview publishing and linking the stack on `origin` |
 | `u` | Preview publishing and linking the stack on `upstream` |
@@ -63,6 +64,11 @@ reset operations; it is not a graph visibility filter. The `log` command uses
 and the already-fetched remote-tracking refs. It discards local-only commits on
 matching `fs-head/*` branches, leaves branches missing from the remote unchanged,
 and refuses to run when tracked files have uncommitted changes.
+
+`d`, followed by `Enter`, switches to the configured base branch and deletes the
+checked-out local `fs-head/*` branch plus its matching `fs-head/*` and
+`fs-base/*` branches on `origin` and `upstream`. The preview must be confirmed,
+and deletion refuses to run if tracked files changed after the preview.
 
 Opening a parent folder starts in the repository sidebar. Highlighting or filtering
 repositories does not load history: press `Enter` to activate one, then `Tab` to
