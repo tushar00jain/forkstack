@@ -885,6 +885,19 @@ fn execute_with_links(
             )
         })
         .collect();
+    let singleton_base_edit = (plan.commits.len() == 1)
+        .then(|| prs[0].as_ref())
+        .flatten()
+        .filter(|pr| pr.base_ref_name != plan.options.base);
+    if let Some(pr) = singleton_base_edit {
+        report("removing pull request from its existing GitHub stack");
+        integrations::gh_stack::unstack_pull_requests(
+            runner,
+            &plan.options.repo,
+            &plan.fork,
+            &[pr.number],
+        )?;
+    }
     let edits: Vec<_> = plan
         .commits
         .iter()

@@ -79,6 +79,18 @@ fn unstack(
         .map_err(|error| format!("could not unstack GitHub stack #{stack_number}: {error}"))
 }
 
+pub(crate) fn unstack_pull_requests(
+    runner: &dyn CommandRunner,
+    repo: &Path,
+    github_repo: &str,
+    pull_requests: &[u64],
+) -> Result<(), String> {
+    for stack_number in existing_stacks(runner, repo, github_repo, pull_requests)?.keys() {
+        unstack(runner, repo, github_repo, *stack_number)?;
+    }
+    Ok(())
+}
+
 pub fn link(
     runner: &dyn CommandRunner,
     repo: &Path,

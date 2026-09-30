@@ -1262,20 +1262,24 @@ fn existing_pr_with_a_different_base_is_relinked() {
 }
 
 #[test]
-fn single_pull_request_targets_base_without_calling_gh_stack_link() {
+fn single_pull_request_is_unstacked_before_targeting_base() {
     let fixture = fixture();
     git(&fixture.repo, &["switch", "--detach", &fixture.first]);
     let runner = FakeRunner::default();
-    runner.state.lock().unwrap().prs.insert(
-        "fs-head/draft/1".into(),
-        FakePr {
-            number: 101,
-            base: "fs-base/draft/1".into(),
-            title: "manually edited title".into(),
-            body: "manual description".into(),
-            draft: true,
-        },
-    );
+    {
+        let mut state = runner.state.lock().unwrap();
+        state.prs.insert(
+            "fs-head/draft/1".into(),
+            FakePr {
+                number: 101,
+                base: "fs-base/draft/1".into(),
+                title: "manually edited title".into(),
+                body: "manual description".into(),
+                draft: true,
+            },
+        );
+        state.stack = Some((7, vec![101, 102]));
+    }
 
     let mut submit = plan(options(&fixture.repo)).unwrap();
     assert_eq!(submit.commits.len(), 1);
@@ -1284,9 +1288,10 @@ fn single_pull_request_targets_base_without_calling_gh_stack_link() {
     let state = runner.state.lock().unwrap();
     assert_eq!(state.prs["fs-head/draft/1"].base, "main");
     assert_eq!(state.prs["fs-head/draft/1"].title, "manually edited title");
+    assert!(state.stack.is_none());
     assert_eq!(
         state.events,
-        ["gh:discover", "git:push", "gh:edit"],
+        ["gh:discover", "git:push", "gh:unstack", "gh:edit"],
         "a single pull request is not a GitHub stack"
     );
 }
