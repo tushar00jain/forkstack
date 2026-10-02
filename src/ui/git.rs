@@ -416,8 +416,8 @@ fn delete_forkstack_branch_with(
     let head = repository
         .head()
         .map_err(|error| error.message().to_owned())?;
-    if head.shorthand() != Some(&plan.branch) {
-        return Err("checked-out branch changed after the deletion preview".into());
+    if head.shorthand() != plan.current_branch.as_deref() {
+        return Err("checkout changed after the deletion preview".into());
     }
     let actual_head = head
         .peel_to_commit()
@@ -474,7 +474,13 @@ fn delete_forkstack_branch_with(
     drop(head);
     drop(repository);
 
-    run(repo, &["switch", &plan.checkout_branch])?;
+    let deletes_current = plan
+        .current_branch
+        .as_ref()
+        .is_some_and(|branch| plan.branches.contains(branch));
+    if deletes_current {
+        run(repo, &["switch", &plan.checkout_branch])?;
+    }
 
     let mut num_remote_branches = 0;
     for remote in ["origin", "upstream"] {
@@ -993,6 +999,7 @@ mod tests {
                 branch: "fs-head/topic/1".into(),
                 branches: vec!["fs-head/topic/1".into()],
                 expected_branches: vec![("fs-head/topic/1".into(), head.clone())],
+                current_branch: Some("fs-head/topic/1".into()),
                 expected_head: head,
                 checkout_branch: "main".into(),
                 expected_checkout: base,

@@ -18,7 +18,7 @@ struct Cli {
 enum Command {
     /// Amend the checked-out stack layer and replay its descendants.
     Amend(AmendArgs),
-    /// Delete the checked-out Forkstack layer or its lower stack.
+    /// Delete a Forkstack layer or its lower stack.
     Delete(DeleteArgs),
     /// Show a Git graph of stacks and branches.
     Log(LogArgs),

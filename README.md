@@ -40,9 +40,9 @@ forkstack move fs-head/topic/2 main --substack
 forkstack move fs-head/topic/2 main --substack --execute
 forkstack reorder fs-head/topic/2 fs-head/other/1 --execute
 
-# Preview or delete the checked-out layer and every lower stack layer
-forkstack delete --substack
-forkstack delete --substack --execute
+# Preview or delete a layer and every lower stack layer
+forkstack delete fs-head/topic/2 --substack
+forkstack delete fs-head/topic/2 --substack --execute
 
 # Open the terminal UI
 forkstack ui --repo . --prefix feat

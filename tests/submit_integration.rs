@@ -392,6 +392,10 @@ fn cli_deletes_checked_out_and_lower_stack_layers() {
     git(&fixture.repo, &["add", "delete-two"]);
     git(&fixture.repo, &["commit", "-m", "delete two"]);
     let second = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "-c", "fs-head/delete/3"]);
+    fs::write(fixture.repo.join("delete-three"), "three\n").unwrap();
+    git(&fixture.repo, &["add", "delete-three"]);
+    git(&fixture.repo, &["commit", "-m", "delete three"]);
     git(
         &fixture.repo,
         &[
@@ -409,6 +413,7 @@ fn cli_deletes_checked_out_and_lower_stack_layers() {
     let preview = Command::new(binary)
         .args([
             "delete",
+            "fs-head/delete/2",
             "--substack",
             "--repo",
             fixture.repo.to_str().unwrap(),
@@ -426,6 +431,7 @@ fn cli_deletes_checked_out_and_lower_stack_layers() {
     let execute = Command::new(binary)
         .args([
             "delete",
+            "fs-head/delete/2",
             "--substack",
             "--execute",
             "--repo",
@@ -438,7 +444,11 @@ fn cli_deletes_checked_out_and_lower_stack_layers() {
         "{}",
         String::from_utf8_lossy(&execute.stderr)
     );
-    assert_eq!(git(&fixture.repo, &["branch", "--show-current"]), "main");
+    assert_eq!(
+        git(&fixture.repo, &["branch", "--show-current"]),
+        "fs-head/delete/3"
+    );
+    assert!(ref_exists(&fixture.repo, "refs/heads/fs-head/delete/3"));
     for identity in ["delete/1", "delete/2"] {
         assert!(!ref_exists(
             &fixture.repo,
