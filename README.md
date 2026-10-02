@@ -19,9 +19,17 @@ During development, replace `forkstack` below with `cargo run --`.
 ## Run
 
 ```sh
-# Preview or publish origin/main..HEAD
-forkstack submit --prefix feat
-forkstack submit --prefix feat --execute
+# Preview origin/main..HEAD using the origin owner's name as the prefix
+forkstack submit
+
+# Record identities and create local fs-head/* branches without publishing
+forkstack submit --local-only
+
+# Push branches, create pull requests, and link the stack
+forkstack submit --execute
+
+# Override the default identity prefix
+forkstack submit --prefix feat --local-only
 
 # Open the terminal UI
 forkstack ui --repo . --prefix feat

@@ -45,6 +45,16 @@ fn short_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
+fn short_identity(identity: &str) -> String {
+    let Some((prefix, suffix)) = identity.split_once('/') else {
+        return identity.to_owned();
+    };
+    let Some(initial) = prefix.chars().next() else {
+        return identity.to_owned();
+    };
+    format!("{initial}/{suffix}")
+}
+
 fn short_branch_name(name: &str) -> String {
     let (remote, name) = if let Some(name) = name.strip_prefix("origin/") {
         ("o/", name)
@@ -54,9 +64,9 @@ fn short_branch_name(name: &str) -> String {
         ("", name)
     };
     let name = if let Some(name) = name.strip_prefix("fs-head/") {
-        format!("h/{name}")
+        format!("h/{}", short_identity(name))
     } else if let Some(name) = name.strip_prefix("fs-base/") {
-        format!("b/{name}")
+        format!("b/{}", short_identity(name))
     } else {
         name.to_owned()
     };
@@ -281,12 +291,12 @@ mod tests {
     #[test]
     fn branch_names_are_shortened_only_for_display() {
         for (name, display) in [
-            ("origin/fs-base/rdma/3", "o/b/rdma/3"),
-            ("origin/fs-head/rdma/3", "o/h/rdma/3"),
-            ("upstream/fs-base/rdma/3", "u/b/rdma/3"),
-            ("upstream/fs-head/rdma/3", "u/h/rdma/3"),
-            ("fs-base/rdma/3", "b/rdma/3"),
-            ("fs-head/rdma/3", "h/rdma/3"),
+            ("origin/fs-base/rdma/3", "o/b/r/3"),
+            ("origin/fs-head/rdma/3", "o/h/r/3"),
+            ("upstream/fs-base/rdma/3", "u/b/r/3"),
+            ("upstream/fs-head/rdma/3", "u/h/r/3"),
+            ("fs-base/rdma/3", "b/r/3"),
+            ("fs-head/rdma/3", "h/r/3"),
             ("topic", "topic"),
         ] {
             assert_eq!(short_branch_name(name), display);
@@ -299,8 +309,8 @@ mod tests {
             remote_refs: vec!["origin/fs-base/rdma/3".into()],
             ..Commit::default()
         };
-        assert!(commit_label(&commit, None).contains("h/rdma/3"));
-        assert!(commit_label(&commit, None).contains("o/b/rdma/3"));
+        assert!(commit_label(&commit, None).contains("h/r/3"));
+        assert!(commit_label(&commit, None).contains("o/b/r/3"));
         assert_eq!(commit.local_refs, ["fs-head/rdma/3"]);
         assert_eq!(commit.remote_refs, ["origin/fs-base/rdma/3"]);
     }
@@ -399,7 +409,7 @@ mod tests {
 
         assert!(rendered[0].text.ends_with(&original));
         assert_eq!(rendered[0].links.len(), 1);
-        assert_eq!(rendered[0].links[0].text, "o/h/topic/1");
+        assert_eq!(rendered[0].links[0].text, "o/h/t/1");
         assert_eq!(rendered[0].links[0].url, "https://example.invalid/9");
     }
 }

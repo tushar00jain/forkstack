@@ -21,13 +21,19 @@ pub struct SubmitArgs {
     pub base: String,
     #[arg(
         long,
-        help = "identity prefix, required only when the stack has untagged commits"
+        help = "identity prefix for untagged commits (default: fork owner)"
     )]
     pub prefix: Option<String>,
     #[arg(long = "no-draft", help = "open PRs ready for review")]
     pub no_draft: bool,
     #[arg(long, help = "actually push branches, create PRs, and link the stack")]
     pub execute: bool,
+    #[arg(
+        long,
+        conflicts_with = "execute",
+        help = "record identities and create local PR head branches without publishing"
+    )]
+    pub local_only: bool,
 }
 
 impl SubmitArgs {
@@ -49,6 +55,10 @@ pub fn run(args: SubmitArgs) -> Result<(), String> {
         let plan = submit::prepare(options, None)?;
         submit::print_summary(&plan);
         submit::execute(plan)
+    } else if args.local_only {
+        let plan = submit::plan(options)?;
+        submit::print_summary(&plan);
+        submit::execute_local(plan)
     } else {
         submit::print_plan(&submit::plan(options)?);
         Ok(())

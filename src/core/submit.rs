@@ -346,10 +346,13 @@ pub fn plan(options: SubmitOptions) -> Result<SubmitPlan, String> {
     plan_with(options, &ProcessRunner)
 }
 
-fn plan_with(options: SubmitOptions, runner: &dyn CommandRunner) -> Result<SubmitPlan, String> {
+fn plan_with(mut options: SubmitOptions, runner: &dyn CommandRunner) -> Result<SubmitPlan, String> {
     let _ = runner;
     let repo = open_repo(&options.repo)?;
     let fork = github_repository_in(&repo, &options.remote)?;
+    if options.prefix.is_none() {
+        options.prefix = fork.split_once('/').map(|(owner, _)| owner.to_owned());
+    }
     let base_ref = format!("{}/{}", options.remote, options.base);
     let base = repo
         .revparse_single(&format!("refs/remotes/{}/{}", options.remote, options.base))
@@ -769,6 +772,19 @@ pub fn execute(mut plan: SubmitPlan) -> Result<(), String> {
     })
 }
 
+pub fn execute_local(mut plan: SubmitPlan) -> Result<(), String> {
+    execute_local_with(&mut plan, &mut |message| println!("{message}"))
+}
+
+fn execute_local_with(plan: &mut SubmitPlan, report: &mut dyn FnMut(&str)) -> Result<(), String> {
+    if plan.commits.iter().any(|step| step.identity_added) {
+        report(&format!("recording stable {IDENTITY_TRAILER} trailers"));
+        rewrite_with_identities(plan)?;
+    }
+    report("updating local PR head branches");
+    sync_local_heads(plan)
+}
+
 fn execute_silent_with_links(
     mut plan: SubmitPlan,
 ) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
@@ -807,12 +823,7 @@ fn execute_with_links(
         was_existing.push(pr.is_some());
         prs.push(pr);
     }
-    if plan.commits.iter().any(|step| step.identity_added) {
-        report(&format!("recording stable {IDENTITY_TRAILER} trailers"));
-        rewrite_with_identities(plan)?;
-    }
-    report("updating local PR head branches");
-    sync_local_heads(plan)?;
+    execute_local_with(plan, report)?;
     report("pushing PR base and head refs");
     integrations::git::push_atomic(
         runner,
@@ -1021,7 +1032,7 @@ pub fn print_plan(plan: &SubmitPlan) {
     } else {
         println!("\n  link the pull requests into a GitHub stack");
     }
-    println!("\nRe-run with --execute to do it.");
+    println!("\nRe-run with --local-only to create local branches or --execute to publish.");
 }
 
 #[cfg(test)]

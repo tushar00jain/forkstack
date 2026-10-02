@@ -26,7 +26,7 @@ pub struct UiArgs {
     pub base: String,
     #[arg(
         long,
-        help = "identity prefix, required when the stack has untagged commits"
+        help = "identity prefix for untagged commits (default: fork owner)"
     )]
     pub prefix: Option<String>,
     #[arg(long = "no-draft", help = "open new PRs ready for review")]

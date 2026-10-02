@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use forkstack::core::submit::test_support;
 use forkstack::core::submit::{
-    SubmitOptions, assign_branches, execute_with, identity_from_message, plan,
+    SubmitOptions, assign_branches, execute_local, execute_with, identity_from_message, plan,
 };
 use forkstack::integrations::{CommandRunner, ProcessRunner};
 use forkstack::ui::git::{
@@ -323,6 +323,58 @@ fn options(repo: &Path) -> SubmitOptions {
         base: "main".into(),
         prefix: Some("draft".into()),
         draft: true,
+    }
+}
+
+#[test]
+fn plan_defaults_prefix_to_fork_owner() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:octocat/example.git",
+        ],
+    );
+    let mut submit_options = options(&fixture.repo);
+    submit_options.prefix = None;
+
+    let submit = plan(submit_options).unwrap();
+
+    assert_eq!(submit.options.prefix.as_deref(), Some("octocat"));
+    assert_eq!(submit.commits[0].branch, "octocat/1");
+    assert_eq!(submit.commits[1].branch, "octocat/2");
+}
+
+#[test]
+fn local_only_records_identities_and_creates_no_remote_refs() {
+    let fixture = fixture();
+
+    execute_local(plan(options(&fixture.repo)).unwrap()).unwrap();
+
+    for (branch, identity) in [
+        ("fs-head/draft/1", "draft/1"),
+        ("fs-head/draft/2", "draft/2"),
+    ] {
+        assert!(ref_exists(&fixture.repo, branch));
+        assert!(
+            git(&fixture.repo, &["show", "-s", "--format=%B", branch])
+                .contains(&format!("fs-branch: {identity}"))
+        );
+        assert!(
+            git(
+                &fixture.repo,
+                &[
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                    &format!("refs/heads/{branch}"),
+                ],
+            )
+            .is_empty()
+        );
     }
 }
 
