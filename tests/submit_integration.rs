@@ -11,7 +11,8 @@ use forkstack::core::submit::{
 };
 use forkstack::integrations::{CommandRunner, ProcessRunner};
 use forkstack::ui::git::{
-    apply_move, apply_move_with_test_executable, checkout, load_graph_for, reset_local_heads,
+    amend_and_restack_with_test_executable, apply_move, apply_move_with_test_executable, checkout,
+    load_graph_for, reset_local_heads,
 };
 use forkstack::ui::model::{MoveMode, MovePlan};
 use serde_json::json;
@@ -376,6 +377,112 @@ fn local_only_records_identities_and_creates_no_remote_refs() {
             .is_empty()
         );
     }
+}
+
+#[test]
+fn amend_preserves_messages_and_replays_descendant_branches() {
+    let fixture = fixture();
+    git(&fixture.repo, &["switch", "-c", "fs-head/amend/1"]);
+    fs::write(fixture.repo.join("amend-one"), "one\n").unwrap();
+    git(&fixture.repo, &["add", "amend-one"]);
+    git(
+        &fixture.repo,
+        &["commit", "-m", "layer one", "-m", "fs-branch: amend/1"],
+    );
+    let old_one = git(&fixture.repo, &["rev-parse", "HEAD"]);
+
+    git(&fixture.repo, &["switch", "-c", "fs-head/amend/2"]);
+    fs::write(fixture.repo.join("amend-two"), "two\n").unwrap();
+    git(&fixture.repo, &["add", "amend-two"]);
+    git(
+        &fixture.repo,
+        &["commit", "-m", "layer two", "-m", "fs-branch: amend/2"],
+    );
+    let old_two = git(&fixture.repo, &["rev-parse", "HEAD"]);
+
+    git(&fixture.repo, &["switch", "-c", "fs-head/amend/3"]);
+    fs::write(fixture.repo.join("amend-three"), "three\n").unwrap();
+    git(&fixture.repo, &["add", "amend-three"]);
+    git(
+        &fixture.repo,
+        &["commit", "-m", "layer three", "-m", "fs-branch: amend/3"],
+    );
+    let old_three = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    let messages = [
+        git(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", "fs-head/amend/1"],
+        ),
+        git(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", "fs-head/amend/2"],
+        ),
+        git(
+            &fixture.repo,
+            &["show", "-s", "--format=%B", "fs-head/amend/3"],
+        ),
+    ];
+
+    git(&fixture.repo, &["switch", "fs-head/amend/1"]);
+    fs::write(fixture.repo.join("amend-one"), "one amended\n").unwrap();
+    git(&fixture.repo, &["add", "amend-one"]);
+
+    let status = amend_and_restack_with_test_executable(
+        &fixture.repo,
+        "origin",
+        "main",
+        Path::new(env!("CARGO_BIN_EXE_forkstack")),
+    )
+    .unwrap();
+
+    let new_one = git(&fixture.repo, &["rev-parse", "fs-head/amend/1"]);
+    let new_two = git(&fixture.repo, &["rev-parse", "fs-head/amend/2"]);
+    let new_three = git(&fixture.repo, &["rev-parse", "fs-head/amend/3"]);
+    assert_ne!(new_one, old_one);
+    assert_ne!(new_two, old_two);
+    assert_ne!(new_three, old_three);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/amend/2^"]),
+        new_one
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/amend/3^"]),
+        new_two
+    );
+    for (branch, message) in [
+        ("fs-head/amend/1", &messages[0]),
+        ("fs-head/amend/2", &messages[1]),
+        ("fs-head/amend/3", &messages[2]),
+    ] {
+        assert_eq!(
+            git(&fixture.repo, &["show", "-s", "--format=%B", branch]),
+            *message
+        );
+        assert!(
+            git(
+                &fixture.repo,
+                &[
+                    "ls-remote",
+                    "--heads",
+                    "origin",
+                    &format!("refs/heads/{branch}")
+                ],
+            )
+            .is_empty()
+        );
+    }
+    assert_eq!(
+        git(&fixture.repo, &["show", "fs-head/amend/1:amend-one"]),
+        "one amended"
+    );
+    assert_eq!(
+        git(&fixture.repo, &["branch", "--show-current"]),
+        "fs-head/amend/1"
+    );
+    assert_eq!(
+        status,
+        "amended fs-head/amend/1 and replayed 2 descendant branch(es)"
+    );
 }
 
 #[derive(Default)]

@@ -62,6 +62,31 @@ pub struct MovePlan {
     pub commits: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayPlan {
+    pub onto: String,
+    pub upstream: String,
+    pub branch: String,
+    pub ref_updates: Vec<(String, String)>,
+    pub commits: Vec<String>,
+}
+
+impl MovePlan {
+    pub fn replay_plan(&self) -> ReplayPlan {
+        ReplayPlan {
+            onto: self.destination.clone(),
+            upstream: if self.commits.len() == self.carried_count {
+                self.source_base.clone()
+            } else {
+                self.destination.clone()
+            },
+            branch: self.checkout_branch.clone(),
+            ref_updates: self.ref_updates.clone(),
+            commits: self.commits.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MoveMode {
     #[default]
@@ -358,6 +383,25 @@ impl Graph {
         let (_, tip_commit, _) = self.stack_tip(selected)?;
         let parent = self.first_parent(selected)?;
         self.linear_segment(&parent, &tip_commit)
+    }
+
+    pub fn plan_descendant_replay(&self, onto: &str) -> Result<Option<ReplayPlan>, String> {
+        self.branch
+            .as_ref()
+            .filter(|branch| branch.starts_with("fs-head/"))
+            .ok_or("check out a Forkstack fs-head branch before amending")?;
+        let (tip, tip_commit, _) = self.stack_tip(&self.head)?;
+        let commits = self.linear_segment(&self.head, &tip_commit)?;
+        if commits.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ReplayPlan {
+            onto: onto.to_owned(),
+            upstream: self.head.clone(),
+            branch: tip,
+            ref_updates: self.ref_updates(&commits),
+            commits,
+        }))
     }
 
     fn descendant_stack_tip(

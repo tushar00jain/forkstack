@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use forkstack::commands::{self, log::LogArgs, submit::SubmitArgs, ui::UiArgs};
+use forkstack::commands::{self, amend::AmendArgs, log::LogArgs, submit::SubmitArgs, ui::UiArgs};
 
 #[derive(Debug, Parser)]
 #[command(about = "Create a stack of one-commit pull requests inside your own fork")]
@@ -12,6 +12,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Amend the checked-out stack layer and replay its descendants.
+    Amend(AmendArgs),
     /// Show a Git graph of stacks and branches.
     Log(LogArgs),
     /// Plan, create, or publish a stack of branches.
@@ -26,6 +28,7 @@ enum Command {
 
 fn main() {
     let result = match Cli::parse().command {
+        Command::Amend(args) => commands::amend::run(args),
         Command::Log(args) => commands::log::run(args),
         Command::Submit(args) => commands::submit::run(args),
         Command::Ui(args) => commands::ui::run(args),

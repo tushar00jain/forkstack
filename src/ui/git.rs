@@ -10,7 +10,7 @@ use git2::{Oid, Repository, RepositoryState, Sort};
 use crate::integrations::git::delete_remote_branches;
 use crate::integrations::github::{PullRequestLink, discover_pr_links};
 use crate::integrations::{CommandRunner, ProcessRunner};
-use crate::ui::model::{Commit, DeleteBranchPlan, Graph, MoveMode, MovePlan};
+use crate::ui::model::{Commit, DeleteBranchPlan, Graph, MoveMode, MovePlan, ReplayPlan};
 
 fn output(repo: &Path, args: &[&str]) -> Result<Output, String> {
     Command::new("git")
@@ -538,14 +538,14 @@ pub fn run_todo_editor(prepared_path: &Path, todo_path: &Path) -> Result<(), Str
     fs::write(todo_path, prepared).map_err(|error| error.to_string())
 }
 
-fn explicit_rebase_todo(plan: &MovePlan) -> String {
+fn explicit_rebase_todo(plan: &ReplayPlan) -> String {
     let mut todo = String::new();
     for commit in &plan.commits {
         todo.push_str(&format!("pick {commit}\n"));
         for (_, branch) in plan
             .ref_updates
             .iter()
-            .filter(|(id, branch)| id == commit && branch != &plan.checkout_branch)
+            .filter(|(id, branch)| id == commit && branch != &plan.branch)
         {
             todo.push_str(&format!("update-ref refs/heads/{branch}\n"));
         }
@@ -553,7 +553,11 @@ fn explicit_rebase_todo(plan: &MovePlan) -> String {
     todo
 }
 
-fn run_explicit_rebase(repo: &Path, plan: &MovePlan, executable: &Path) -> Result<Output, String> {
+fn run_explicit_rebase(
+    repo: &Path,
+    plan: &ReplayPlan,
+    executable: &Path,
+) -> Result<Output, String> {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -565,11 +569,6 @@ fn run_explicit_rebase(repo: &Path, plan: &MovePlan, executable: &Path) -> Resul
         shell_quote(&executable.to_string_lossy()),
         shell_quote(&todo_path.to_string_lossy())
     );
-    let upstream = if plan.commits.len() == plan.carried_count {
-        &plan.source_base
-    } else {
-        &plan.destination
-    };
     let result = Command::new("git")
         .current_dir(repo)
         .args([
@@ -579,9 +578,9 @@ fn run_explicit_rebase(repo: &Path, plan: &MovePlan, executable: &Path) -> Resul
             "--interactive",
             "--update-refs",
             "--onto",
-            &plan.destination,
-            upstream,
-            &plan.checkout_branch,
+            &plan.onto,
+            &plan.upstream,
+            &plan.branch,
         ])
         .env("GIT_SEQUENCE_EDITOR", editor)
         .output()
@@ -621,7 +620,7 @@ fn apply_move_with_executable(
         run(repo, &["switch", "--detach", &plan.tip_commit])?;
     }
     let result = if plan.mode == MoveMode::Direct || plan.include_descendants {
-        run_explicit_rebase(repo, plan, executable)?
+        run_explicit_rebase(repo, &plan.replay_plan(), executable)?
     } else {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -700,6 +699,92 @@ pub fn apply_move_with_test_executable(
     executable: &Path,
 ) -> Result<(), String> {
     apply_move_with_executable(repo, plan, executable)
+}
+
+pub fn amend_and_restack(repo: &Path, remote: &str, base: &str) -> Result<String, String> {
+    let executable = env::current_exe().map_err(|error| error.to_string())?;
+    amend_and_restack_with_executable(repo, remote, base, &executable)
+}
+
+fn amend_and_restack_with_executable(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    executable: &Path,
+) -> Result<String, String> {
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    if repository.state() != RepositoryState::Clean {
+        return Err("cannot amend while a Git operation is in progress".into());
+    }
+    let head = repository
+        .head()
+        .map_err(|error| error.message().to_owned())?;
+    let branch = head
+        .shorthand()
+        .filter(|branch| branch.starts_with("fs-head/"))
+        .ok_or("check out a Forkstack fs-head branch before amending")?
+        .to_owned();
+    let old_commit = head
+        .peel_to_commit()
+        .map_err(|error| error.message().to_owned())?;
+    let old_message = old_commit.message_bytes().to_owned();
+    drop(old_commit);
+    drop(head);
+    drop(repository);
+
+    let unstaged = output(repo, &["diff", "--quiet"])?;
+    if !unstaged.status.success() {
+        return Err("cannot amend with unstaged tracked changes; stage or stash them first".into());
+    }
+    let staged = output(repo, &["diff", "--cached", "--quiet"])?;
+    if staged.status.success() {
+        return Err("there are no staged changes to amend".into());
+    }
+
+    let graph = load_graph_for(repo, remote, base)?;
+    run(repo, &["commit", "--amend", "--no-edit"])?;
+
+    let repository = Repository::discover(repo).map_err(|error| error.message().to_owned())?;
+    let new_commit = repository
+        .head()
+        .and_then(|head| head.peel_to_commit())
+        .map_err(|error| error.message().to_owned())?;
+    if new_commit.message_bytes() != old_message {
+        return Err("the amend changed the commit message; descendants were not replayed".into());
+    }
+    let new_head = new_commit.id().to_string();
+    drop(new_commit);
+    drop(repository);
+
+    let Some(plan) = graph.plan_descendant_replay(&new_head)? else {
+        return Ok(format!("amended {branch}; no descendants to replay"));
+    };
+    let replayed = plan
+        .ref_updates
+        .iter()
+        .filter(|(_, name)| name.starts_with("fs-head/"))
+        .count();
+    let result = run_explicit_rebase(repo, &plan, executable)?;
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&result.stdout).trim().to_owned();
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+    run(repo, &["switch", &branch])?;
+    Ok(format!(
+        "amended {branch} and replayed {replayed} descendant branch(es)"
+    ))
+}
+
+#[cfg(feature = "integration-tests")]
+#[doc(hidden)]
+pub fn amend_and_restack_with_test_executable(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+    executable: &Path,
+) -> Result<String, String> {
+    amend_and_restack_with_executable(repo, remote, base, executable)
 }
 
 pub(crate) fn displayed_remote_heads(graph: &Graph, remote: &str) -> Vec<String> {
@@ -1016,7 +1101,7 @@ mod tests {
         };
 
         assert_eq!(
-            explicit_rebase_todo(&plan),
+            explicit_rebase_todo(&plan.replay_plan()),
             "pick beta2\n\
              update-ref refs/heads/fs-head/beta/2\n\
              pick beta3\n\

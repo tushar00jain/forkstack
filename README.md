@@ -31,6 +31,10 @@ forkstack submit --execute
 # Override the default identity prefix
 forkstack submit --prefix feat --local-only
 
+# Amend staged changes into the checked-out layer and replay later layers
+git add <paths>
+forkstack amend
+
 # Open the terminal UI
 forkstack ui --repo . --prefix feat
 
