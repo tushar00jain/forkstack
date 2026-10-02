@@ -122,7 +122,7 @@ fn help_lines() -> Vec<Line<'static>> {
     vec![
         help_line("m/M", "move exact commit / substack"),
         help_line("z/Z", "reorder commit / substack"),
-        help_line("d", "preview deleting the checked-out ForkStack branch"),
+        help_line("d/D", "delete checked-out branch / lower stack"),
         help_line("l", "preview local reset to origin"),
         help_line("o", "preview origin publish and stack link"),
         help_line("u", "preview upstream publish and stack link"),
@@ -834,7 +834,7 @@ impl App {
         self.dirty = true;
     }
 
-    fn preview_delete_branch(&mut self) {
+    fn preview_delete_branch(&mut self, lower_stack: bool) {
         if self.state.busy.is_some() {
             self.reject_busy_operation();
             return;
@@ -844,15 +844,16 @@ impl App {
             return;
         };
         match graph
-            .plan_delete_current_branch(&self.publish_options.base)
+            .plan_delete_current_branches(&self.publish_options.base, lower_stack)
             .and_then(|plan| {
                 let preview = graph.delete_branch_preview(&plan)?;
                 Ok((plan, preview))
             }) {
             Ok((plan, preview)) => {
                 self.state.status = Some(format!(
-                    "previewing deletion of {} locally and its origin/upstream head/base branches; press Enter to confirm",
-                    plan.branch
+                    "previewing deletion of {} local branch{} and their origin/upstream head/base branches; press Enter to confirm",
+                    plan.branches.len(),
+                    if plan.branches.len() == 1 { "" } else { "es" }
                 ));
                 self.state.delete_plan = Some(plan);
                 self.state.preview = Some(preview);
@@ -993,7 +994,9 @@ impl App {
             && matches!(
                 key.code,
                 KeyCode::Enter
-                    | KeyCode::Char('d' | 'l' | 'm' | 'M' | 'z' | 'Z' | 'o' | 'r' | 'u' | 'q')
+                    | KeyCode::Char(
+                        'd' | 'D' | 'l' | 'm' | 'M' | 'z' | 'Z' | 'o' | 'r' | 'u' | 'q'
+                    )
             )
         {
             self.reject_busy_operation();
@@ -1007,7 +1010,8 @@ impl App {
             (KeyCode::Up, _) | (KeyCode::Char('k'), _) => self.move_cursor(-1),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => self.move_cursor(1),
             (KeyCode::Enter, _) => self.enter(),
-            (KeyCode::Char('d'), _) => self.preview_delete_branch(),
+            (KeyCode::Char('d'), _) => self.preview_delete_branch(false),
+            (KeyCode::Char('D'), _) => self.preview_delete_branch(true),
             (KeyCode::Char('l'), _) => self.preview_local_reset(),
             (KeyCode::Char('o'), _) => self.preview_publish(self.publish_options.remote.clone()),
             (KeyCode::Char('u'), _) => self.preview_publish("upstream".into()),
@@ -1692,7 +1696,7 @@ mod tests {
         for binding in [
             "m/M          move exact commit / substack",
             "z/Z          reorder commit / substack",
-            "d            preview deleting the checked-out ForkStack branch",
+            "d/D          delete checked-out branch / lower stack",
             "l            preview local reset to origin",
             "o            preview origin publish and stack link",
             "u            preview upstream publish and stack link",
@@ -1816,6 +1820,55 @@ mod tests {
             Operation::DeleteBranch(_)
         ));
         assert_eq!(app.state.busy, Some(Busy::Mutation));
+    }
+
+    #[test]
+    fn uppercase_delete_previews_current_and_lower_layers() {
+        let (mut app, operations, _events) = test_app();
+        app.state.graph = Some(Graph {
+            commits: [
+                (
+                    "head".into(),
+                    crate::ui::model::Commit {
+                        id: "head".into(),
+                        parents: vec!["lower".into()],
+                        local_refs: vec!["fs-head/topic/2".into()],
+                        is_head: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "lower".into(),
+                    crate::ui::model::Commit {
+                        id: "lower".into(),
+                        parents: vec!["base".into()],
+                        local_refs: vec!["fs-head/topic/1".into()],
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "base".into(),
+                    crate::ui::model::Commit {
+                        id: "base".into(),
+                        local_refs: vec!["main".into()],
+                        ..Default::default()
+                    },
+                ),
+            ]
+            .into(),
+            order: vec!["head".into(), "lower".into(), "base".into()],
+            head: "head".into(),
+            branch: Some("fs-head/topic/2".into()),
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+
+        assert!(operations.try_recv().is_err());
+        assert_eq!(
+            app.state.delete_plan.as_ref().unwrap().branches,
+            ["fs-head/topic/1", "fs-head/topic/2"]
+        );
+        assert!(app.state.preview.is_some());
     }
 
     #[test]

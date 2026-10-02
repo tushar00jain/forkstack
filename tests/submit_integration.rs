@@ -380,6 +380,88 @@ fn local_only_records_identities_and_creates_no_remote_refs() {
 }
 
 #[test]
+fn cli_deletes_checked_out_and_lower_stack_layers() {
+    let fixture = fixture();
+    git(&fixture.repo, &["switch", "-c", "fs-head/delete/1"]);
+    fs::write(fixture.repo.join("delete-one"), "one\n").unwrap();
+    git(&fixture.repo, &["add", "delete-one"]);
+    git(&fixture.repo, &["commit", "-m", "delete one"]);
+    let first = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(&fixture.repo, &["switch", "-c", "fs-head/delete/2"]);
+    fs::write(fixture.repo.join("delete-two"), "two\n").unwrap();
+    git(&fixture.repo, &["add", "delete-two"]);
+    git(&fixture.repo, &["commit", "-m", "delete two"]);
+    let second = git(&fixture.repo, &["rev-parse", "HEAD"]);
+    git(
+        &fixture.repo,
+        &[
+            "push",
+            "origin",
+            &format!("{}:refs/heads/fs-base/delete/1", fixture.second),
+            &format!("{first}:refs/heads/fs-head/delete/1"),
+            &format!("{first}:refs/heads/fs-base/delete/2"),
+            &format!("{second}:refs/heads/fs-head/delete/2"),
+        ],
+    );
+    fetch_all(&fixture.repo);
+    let binary = env!("CARGO_BIN_EXE_forkstack");
+
+    let preview = Command::new(binary)
+        .args([
+            "delete",
+            "--substack",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(preview.status.success());
+    let stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(stdout.contains("fs-head/delete/1"));
+    assert!(stdout.contains("fs-head/delete/2"));
+    assert!(stdout.contains("Dry run. Re-run with --execute to apply."));
+    assert!(ref_exists(&fixture.repo, "refs/heads/fs-head/delete/1"));
+    assert!(ref_exists(&fixture.repo, "refs/heads/fs-head/delete/2"));
+
+    let execute = Command::new(binary)
+        .args([
+            "delete",
+            "--substack",
+            "--execute",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        execute.status.success(),
+        "{}",
+        String::from_utf8_lossy(&execute.stderr)
+    );
+    assert_eq!(git(&fixture.repo, &["branch", "--show-current"]), "main");
+    for identity in ["delete/1", "delete/2"] {
+        assert!(!ref_exists(
+            &fixture.repo,
+            &format!("refs/heads/fs-head/{identity}")
+        ));
+        for kind in ["fs-head", "fs-base"] {
+            assert!(
+                git(
+                    &fixture.repo,
+                    &[
+                        "ls-remote",
+                        "--heads",
+                        "origin",
+                        &format!("refs/heads/{kind}/{identity}"),
+                    ],
+                )
+                .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
 fn amend_preserves_messages_and_replays_descendant_branches() {
     let fixture = fixture();
     git(&fixture.repo, &["switch", "-c", "fs-head/amend/1"]);
@@ -948,6 +1030,71 @@ fn direct_substack_move_creates_a_parallel_tree() {
     assert_eq!(
         git(&fixture.repo, &["branch", "--show-current"]),
         "fs-head/rdma/3"
+    );
+}
+
+#[test]
+fn cli_previews_reorder_and_executes_substack_move() {
+    let fixture = fixture();
+    let (old_rdma2, old_rdma3) = add_linear_forkstack_branches(&fixture);
+    let binary = env!("CARGO_BIN_EXE_forkstack");
+
+    let preview = Command::new(binary)
+        .args([
+            "reorder",
+            "fs-head/rdma/2",
+            "main",
+            "--substack",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&preview.stdout);
+    assert!(stdout.contains("reorder: fs-head/rdma/2 substack onto main"));
+    assert!(stdout.contains("Dry run. Re-run with --execute to apply."));
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/2"]),
+        old_rdma2
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3"]),
+        old_rdma3
+    );
+
+    let execute = Command::new(binary)
+        .args([
+            "move",
+            "fs-head/rdma/2",
+            "main",
+            "--substack",
+            "--execute",
+            "--repo",
+            fixture.repo.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        execute.status.success(),
+        "{}",
+        String::from_utf8_lossy(&execute.stderr)
+    );
+    let new_rdma2 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/2"]);
+    let new_rdma3 = git(&fixture.repo, &["rev-parse", "fs-head/rdma/3"]);
+    assert_ne!(new_rdma2, old_rdma2);
+    assert_ne!(new_rdma3, old_rdma3);
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/2^"]),
+        fixture.base
+    );
+    assert_eq!(
+        git(&fixture.repo, &["rev-parse", "fs-head/rdma/3^"]),
+        new_rdma2
     );
 }
 

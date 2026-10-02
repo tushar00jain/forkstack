@@ -27,6 +27,8 @@ pub struct Graph {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteBranchPlan {
     pub branch: String,
+    pub branches: Vec<String>,
+    pub expected_branches: Vec<(String, String)>,
     pub expected_head: String,
     pub checkout_branch: String,
     pub expected_checkout: String,
@@ -96,11 +98,19 @@ pub enum MoveMode {
 
 impl Graph {
     pub fn plan_delete_current_branch(&self, base: &str) -> Result<DeleteBranchPlan, String> {
+        self.plan_delete_current_branches(base, false)
+    }
+
+    pub fn plan_delete_current_branches(
+        &self,
+        base: &str,
+        lower_stack: bool,
+    ) -> Result<DeleteBranchPlan, String> {
         let branch = self
             .branch
             .as_deref()
             .ok_or("cannot delete from a detached HEAD")?;
-        let identity = branch
+        branch
             .strip_prefix("fs-head/")
             .filter(|name| !name.is_empty())
             .ok_or("the checked-out branch is not a ForkStack fs-head branch")?;
@@ -110,16 +120,57 @@ impl Graph {
             .find(|commit| commit.local_refs.iter().any(|name| name == base))
             .map(|commit| commit.id.clone())
             .ok_or_else(|| format!("local base branch {base:?} is not visible"))?;
+        let branches = if lower_stack {
+            let mut branches = Vec::new();
+            let mut current = self.head.clone();
+            while current != expected_checkout {
+                let commit = self
+                    .commits
+                    .get(&current)
+                    .ok_or_else(|| format!("local base branch {base:?} is not an ancestor"))?;
+                branches.extend(
+                    commit
+                        .local_refs
+                        .iter()
+                        .filter(|name| name.starts_with("fs-head/"))
+                        .cloned(),
+                );
+                current = self.first_parent(&current)?;
+            }
+            branches.sort();
+            branches.dedup();
+            branches
+        } else {
+            vec![branch.to_owned()]
+        };
+        if !branches.iter().any(|candidate| candidate == branch) {
+            return Err("checked-out ForkStack branch is not on its HEAD commit".into());
+        }
+        let expected_branches = branches
+            .iter()
+            .map(|branch| {
+                self.commits
+                    .values()
+                    .find(|commit| commit.local_refs.contains(branch))
+                    .map(|commit| (branch.clone(), commit.id.clone()))
+                    .ok_or_else(|| format!("local branch {branch:?} is not visible"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let remote_branches = ["origin", "upstream"]
             .into_iter()
             .flat_map(|remote| {
-                ["fs-head", "fs-base"]
-                    .into_iter()
-                    .map(move |kind| (remote.to_owned(), format!("{kind}/{identity}")))
+                branches.iter().flat_map(move |branch| {
+                    let identity = branch.trim_start_matches("fs-head/");
+                    ["fs-head", "fs-base"]
+                        .into_iter()
+                        .map(move |kind| (remote.to_owned(), format!("{kind}/{identity}")))
+                })
             })
             .collect();
         Ok(DeleteBranchPlan {
             branch: branch.to_owned(),
+            branches,
+            expected_branches,
             expected_head: self.head.clone(),
             checkout_branch: base.to_owned(),
             expected_checkout,
@@ -137,8 +188,9 @@ impl Graph {
             .iter()
             .map(|(remote, branch)| format!("{remote}/{branch}"))
             .collect();
+        let local_refs: HashSet<_> = plan.branches.iter().collect();
         for commit in graph.commits.values_mut() {
-            commit.local_refs.retain(|name| name != &plan.branch);
+            commit.local_refs.retain(|name| !local_refs.contains(name));
             commit
                 .remote_refs
                 .retain(|name| !remote_refs.contains(name));
@@ -1014,6 +1066,78 @@ mod tests {
             graph.plan_delete_current_branch("main").unwrap_err(),
             "the checked-out branch is not a ForkStack fs-head branch"
         );
+    }
+
+    #[test]
+    fn lower_stack_delete_includes_current_and_ancestor_layers_only() {
+        let mut graph = Graph {
+            commits: [
+                (
+                    "base".into(),
+                    Commit {
+                        id: "base".into(),
+                        local_refs: vec!["main".into()],
+                        ..Commit::default()
+                    },
+                ),
+                (
+                    "lower".into(),
+                    Commit {
+                        id: "lower".into(),
+                        parents: vec!["base".into()],
+                        local_refs: vec!["fs-head/topic/1".into()],
+                        ..Commit::default()
+                    },
+                ),
+                (
+                    "current".into(),
+                    Commit {
+                        id: "current".into(),
+                        parents: vec!["lower".into()],
+                        local_refs: vec!["fs-head/topic/2".into()],
+                        is_head: true,
+                        ..Commit::default()
+                    },
+                ),
+                (
+                    "upper".into(),
+                    Commit {
+                        id: "upper".into(),
+                        parents: vec!["current".into()],
+                        local_refs: vec!["fs-head/topic/3".into()],
+                        ..Commit::default()
+                    },
+                ),
+            ]
+            .into(),
+            order: vec![
+                "upper".into(),
+                "current".into(),
+                "lower".into(),
+                "base".into(),
+            ],
+            head: "current".into(),
+            branch: Some("fs-head/topic/2".into()),
+        };
+        for commit in graph.commits.values_mut() {
+            for remote in ["origin", "upstream"] {
+                for branch in &commit.local_refs {
+                    if branch.starts_with("fs-head/") {
+                        commit.remote_refs.push(format!("{remote}/{branch}"));
+                    }
+                }
+            }
+        }
+
+        let plan = graph.plan_delete_current_branches("main", true).unwrap();
+        let preview = graph.delete_branch_preview(&plan).unwrap();
+
+        assert_eq!(plan.branches, ["fs-head/topic/1", "fs-head/topic/2"]);
+        assert_eq!(plan.remote_branches.len(), 8);
+        assert!(preview.commits["lower"].local_refs.is_empty());
+        assert!(preview.commits["current"].local_refs.is_empty());
+        assert_eq!(preview.commits["upper"].local_refs, ["fs-head/topic/3"]);
+        assert_eq!(preview.branch.as_deref(), Some("main"));
     }
 
     #[test]

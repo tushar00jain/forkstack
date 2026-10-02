@@ -264,6 +264,32 @@ pub fn checkout(repo: &Path, revision: &str, branch: Option<&str>) -> Result<(),
     Ok(())
 }
 
+fn checked_out_worktree_refs(
+    repository: &Repository,
+    current: Option<&str>,
+) -> Result<BTreeSet<String>, String> {
+    let mut checked_out = BTreeSet::new();
+    for name in repository
+        .worktrees()
+        .map_err(|error| error.message().to_owned())?
+        .iter()
+        .flatten()
+    {
+        let worktree = repository
+            .find_worktree(name)
+            .map_err(|error| error.message().to_owned())?;
+        let worktree_repo =
+            Repository::open(worktree.path()).map_err(|error| error.message().to_owned())?;
+        if let Ok(head) = worktree_repo.head()
+            && let Some(name) = head.name()
+            && Some(name) != current
+        {
+            checked_out.insert(name.to_owned());
+        }
+    }
+    Ok(checked_out)
+}
+
 /// Force every existing local `fs-head/*` branch to the matching fetched ref
 /// for `remote`. Branches without a matching remote ref are left alone.
 pub fn reset_local_heads(repo: &Path, remote: &str) -> Result<String, String> {
@@ -280,25 +306,7 @@ pub fn reset_local_heads(repo: &Path, remote: &str) -> Result<String, String> {
         .ok()
         .filter(|head| head.is_branch())
         .and_then(|head| head.name().map(str::to_owned));
-    let mut checked_out_elsewhere = BTreeSet::new();
-    for name in repository
-        .worktrees()
-        .map_err(|error| error.message().to_owned())?
-        .iter()
-        .flatten()
-    {
-        let worktree = repository
-            .find_worktree(name)
-            .map_err(|error| error.message().to_owned())?;
-        let worktree_repo =
-            Repository::open(worktree.path()).map_err(|error| error.message().to_owned())?;
-        if let Ok(head) = worktree_repo.head()
-            && let Some(name) = head.name()
-            && Some(name) != current.as_deref()
-        {
-            checked_out_elsewhere.insert(name.to_owned());
-        }
-    }
+    let checked_out_elsewhere = checked_out_worktree_refs(&repository, current.as_deref())?;
 
     let mut updates = Vec::new();
     let mut missing = Vec::new();
@@ -419,6 +427,25 @@ fn delete_forkstack_branch_with(
     if actual_head != plan.expected_head {
         return Err("checked-out branch moved after the deletion preview".into());
     }
+    let checked_out_elsewhere = checked_out_worktree_refs(&repository, head.name())?;
+    for (branch, expected) in &plan.expected_branches {
+        let full_name = format!("refs/heads/{branch}");
+        if checked_out_elsewhere.contains(&full_name) {
+            return Err(format!(
+                "cannot delete {branch:?}: it is checked out in another worktree"
+            ));
+        }
+        let actual = repository
+            .find_branch(branch, git2::BranchType::Local)
+            .ok()
+            .and_then(|branch| branch.get().peel_to_commit().ok())
+            .map(|commit| commit.id().to_string());
+        if actual.as_deref() != Some(expected) {
+            return Err(format!(
+                "local branch {branch:?} moved after the deletion preview"
+            ));
+        }
+    }
     let checkout = repository
         .find_branch(&plan.checkout_branch, git2::BranchType::Local)
         .map_err(|_| {
@@ -469,11 +496,17 @@ fn delete_forkstack_branch_with(
                 .collect::<Vec<_>>(),
         )?;
     }
-    run(repo, &["branch", "-D", &plan.branch])?;
+    let mut delete_args = vec!["branch", "-D"];
+    delete_args.extend(plan.branches.iter().map(String::as_str));
+    run(repo, &delete_args)?;
 
+    let local = if plan.branches.len() == 1 {
+        format!("{} locally", plan.branches[0])
+    } else {
+        format!("{} local branches", plan.branches.len())
+    };
     Ok(format!(
-        "deleted {} locally and {num_remote_branches} remote branch{}",
-        plan.branch,
+        "deleted {local} and {num_remote_branches} remote branch{}",
         if num_remote_branches == 1 { "" } else { "es" }
     ))
 }
@@ -958,6 +991,8 @@ mod tests {
             &repo,
             &DeleteBranchPlan {
                 branch: "fs-head/topic/1".into(),
+                branches: vec!["fs-head/topic/1".into()],
+                expected_branches: vec![("fs-head/topic/1".into(), head.clone())],
                 expected_head: head,
                 checkout_branch: "main".into(),
                 expected_checkout: base,
