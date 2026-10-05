@@ -173,7 +173,7 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
     let mut walk = repository
         .revwalk()
         .map_err(|error| error.message().to_owned())?;
-    walk.set_sorting(Sort::TOPOLOGICAL)
+    walk.set_sorting(Sort::TOPOLOGICAL | Sort::TIME)
         .map_err(|error| error.message().to_owned())?;
     for root in &roots {
         walk.push(*root)
