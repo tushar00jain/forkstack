@@ -610,6 +610,8 @@ struct FakeState {
     prs: BTreeMap<String, FakePr>,
     stack: Option<(u64, Vec<u64>)>,
     pushes: Vec<Vec<String>>,
+    bases_at_push: Vec<BTreeMap<String, String>>,
+    bases_at_link: Vec<BTreeMap<String, String>>,
     events: Vec<String>,
 }
 
@@ -656,7 +658,13 @@ impl CommandRunner for FakeRunner {
         if program == "git" {
             if args.first().is_some_and(|arg| arg == "push") {
                 let mut state = self.state.lock().unwrap();
+                let bases = state
+                    .prs
+                    .iter()
+                    .map(|(head, pr)| (head.clone(), pr.base.clone()))
+                    .collect();
                 state.pushes.push(args.to_vec());
+                state.bases_at_push.push(bases);
                 state.events.push("git:push".into());
             }
             return ProcessRunner.run(program, args, repo, input, env);
@@ -693,6 +701,12 @@ impl CommandRunner for FakeRunner {
             let base_index = args.iter().position(|arg| arg == "--base").unwrap();
             let branch_start = base_index + 2;
             let branches = &args[branch_start..];
+            let bases = state
+                .prs
+                .iter()
+                .map(|(head, pr)| (head.clone(), pr.base.clone()))
+                .collect();
+            state.bases_at_link.push(bases);
             for (index, branch) in branches.iter().enumerate() {
                 state.prs.get_mut(branch).unwrap().base = if index == 0 {
                     args[base_index + 1].clone()
@@ -1685,6 +1699,15 @@ fn execute_creates_and_then_restacks_pull_requests() {
         assert!(second.body.contains("- -> #102 second change"));
         assert!(first.draft && second.draft);
         assert_eq!(state.pushes.len(), 1);
+        assert!(state.bases_at_push[0].is_empty());
+        assert_eq!(
+            state.bases_at_link[0],
+            BTreeMap::from([
+                ("fs-head/draft/1".into(), "fs-base/draft/1".into(),),
+                ("fs-head/draft/2".into(), "fs-base/draft/2".into(),),
+            ]),
+            "new PRs must initially target stable base refs"
+        );
         assert!(state.pushes[0].contains(&"--atomic".into()));
         assert!(state.pushes[0].contains(&"--force-with-lease".into()));
         assert_eq!(
@@ -1778,8 +1801,24 @@ fn execute_creates_and_then_restacks_pull_requests() {
     assert!(state.pushes[1].contains(&"--atomic".into()));
     assert!(state.pushes[1].contains(&"--force-with-lease".into()));
     assert_eq!(
+        state.bases_at_push[1],
+        BTreeMap::from([
+            ("fs-head/draft/1".into(), "fs-base/draft/1".into(),),
+            ("fs-head/draft/2".into(), "fs-base/draft/2".into(),),
+        ]),
+        "PRs must target stable base refs while rewritten heads are pushed"
+    );
+    assert_eq!(state.bases_at_link[1], state.bases_at_push[1]);
+    assert_eq!(
         &state.events[5..],
-        ["gh:discover", "git:push", "gh:edit", "gh:link"]
+        [
+            "gh:discover",
+            "gh:unstack",
+            "gh:edit",
+            "git:push",
+            "gh:edit",
+            "gh:link",
+        ]
     );
     drop(state);
 
@@ -1787,8 +1826,14 @@ fn execute_creates_and_then_restacks_pull_requests() {
     execute_with(&mut unchanged_plan, &runner, &mut |_| {}).unwrap();
     let state = runner.state.lock().unwrap();
     assert_eq!(
-        &state.events[9..],
-        ["gh:discover", "git:push", "gh:link"],
+        &state.events[11..],
+        [
+            "gh:discover",
+            "gh:unstack",
+            "gh:edit",
+            "git:push",
+            "gh:link",
+        ],
         "an unchanged existing stack uses one batched GitHub read and relinks the stack"
     );
 }
@@ -1813,7 +1858,13 @@ fn removed_layer_is_unstacked_before_the_remaining_prs_are_relinked() {
     let state = runner.state.lock().unwrap();
     assert_eq!(
         state.events,
-        ["gh:discover", "git:push", "gh:unstack", "gh:link"]
+        [
+            "gh:discover",
+            "gh:unstack",
+            "gh:edit",
+            "git:push",
+            "gh:link",
+        ]
     );
     assert_eq!(
         state.stack.as_ref().unwrap().1,

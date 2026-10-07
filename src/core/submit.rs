@@ -805,15 +805,7 @@ fn execute_with_links(
     report: &mut dyn FnMut(&str),
 ) -> Result<BTreeMap<String, integrations::github::PullRequestLink>, String> {
     let heads: Vec<_> = plan.commits.iter().map(StackCommit::head_branch).collect();
-    let bases: Vec<_> = (0..plan.commits.len())
-        .map(|index| {
-            if index == 0 {
-                plan.options.base.clone()
-            } else {
-                heads[index - 1].clone()
-            }
-        })
-        .collect();
+    let stable_bases: Vec<_> = plan.commits.iter().map(StackCommit::base_branch).collect();
     let mut discovery =
         integrations::github::discover_prs(runner, &plan.options.repo, &plan.fork, &heads)?;
     let mut prs = Vec::with_capacity(plan.commits.len());
@@ -822,6 +814,45 @@ fn execute_with_links(
         let pr = discovery.by_head.remove(&step.head_branch());
         was_existing.push(pr.is_some());
         prs.push(pr);
+    }
+    let stabilize_indices: Vec<_> = prs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pr)| {
+            pr.as_ref()
+                .filter(|pr| pr.base_ref_name != stable_bases[index])
+                .map(|_| index)
+        })
+        .collect();
+    let unstacked_for_stabilization = !stabilize_indices.is_empty();
+    if !stabilize_indices.is_empty() {
+        report("removing pull requests from existing GitHub stacks");
+        let pull_requests: Vec<_> = stabilize_indices
+            .iter()
+            .map(|&index| prs[index].as_ref().unwrap().number)
+            .collect();
+        integrations::gh_stack::unstack_pull_requests(
+            runner,
+            &plan.options.repo,
+            &plan.fork,
+            &pull_requests,
+        )?;
+        report("retargeting existing pull requests to stable base branches");
+        let edits: Vec<_> = stabilize_indices
+            .iter()
+            .map(|&index| {
+                let pr = prs[index].as_ref().unwrap();
+                integrations::github::EditPullRequest {
+                    id: &pr.id,
+                    body: &pr.body,
+                    base: Some(&stable_bases[index]),
+                }
+            })
+            .collect();
+        integrations::github::edit_prs(runner, &plan.options.repo, &edits)?;
+        for index in stabilize_indices {
+            prs[index].as_mut().unwrap().base_ref_name = stable_bases[index].clone();
+        }
     }
     execute_local_with(plan, report)?;
     report("pushing PR base and head refs");
@@ -842,7 +873,7 @@ fn execute_with_links(
     let create_requests: Vec<_> = missing
         .iter()
         .map(|(index, step)| integrations::github::CreatePullRequest {
-            base: &bases[*index],
+            base: &stable_bases[*index],
             head: &heads[*index],
             title: &step.subject,
             body: &step.body,
@@ -900,7 +931,7 @@ fn execute_with_links(
         .then(|| prs[0].as_ref())
         .flatten()
         .filter(|pr| pr.base_ref_name != plan.options.base);
-    if let Some(pr) = singleton_base_edit {
+    if let Some(pr) = singleton_base_edit.filter(|_| !unstacked_for_stabilization) {
         report("removing pull request from its existing GitHub stack");
         integrations::gh_stack::unstack_pull_requests(
             runner,
