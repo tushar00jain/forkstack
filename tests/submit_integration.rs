@@ -987,6 +987,21 @@ fn graph_walks_all_local_branch_history() {
 }
 
 #[test]
+fn graph_stops_after_the_visible_roots_common_merge_base() {
+    let fixture = fixture();
+    git(
+        &fixture.repo,
+        &["update-ref", "refs/remotes/origin/main", &fixture.first],
+    );
+
+    let graph = load_graph_for(&fixture.repo, "origin", "main").unwrap();
+
+    assert!(graph.commits.contains_key(&fixture.first));
+    assert!(graph.commits.contains_key(&fixture.second));
+    assert!(!graph.commits.contains_key(&fixture.base));
+}
+
+#[test]
 fn graph_reads_conflicted_paths_from_the_index() {
     let fixture = fixture();
     git(

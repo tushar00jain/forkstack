@@ -388,6 +388,104 @@ impl Graph {
         false
     }
 
+    fn children(&self) -> HashMap<String, Vec<String>> {
+        let mut children: HashMap<String, Vec<String>> = self
+            .commits
+            .keys()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect();
+        for commit in self.commits.values() {
+            for parent in &commit.parents {
+                if let Some(parent_children) = children.get_mut(parent) {
+                    parent_children.push(commit.id.clone());
+                }
+            }
+        }
+        children
+    }
+
+    /// Return commits reachable by following child edges from `ancestor`.
+    fn descendants(&self, ancestor: &str) -> HashSet<String> {
+        let children = self.children();
+        let mut descendants = HashSet::new();
+        let mut pending = vec![ancestor.to_owned()];
+        while let Some(id) = pending.pop() {
+            if !descendants.insert(id.clone()) {
+                continue;
+            }
+            if let Some(next) = children.get(&id) {
+                pending.extend(next.iter().cloned());
+            }
+        }
+        descendants
+    }
+
+    fn descendant_forkstack_candidates(
+        &self,
+        ancestor: &str,
+        excluded: &HashSet<String>,
+    ) -> HashMap<String, Vec<String>> {
+        let descendants = self.descendants(ancestor);
+        self.commits
+            .values()
+            .filter(|commit| descendants.contains(&commit.id) && !excluded.contains(&commit.id))
+            .filter_map(|commit| {
+                let names: Vec<_> = commit
+                    .local_refs
+                    .iter()
+                    .filter(|name| name.starts_with("fs-head/"))
+                    .cloned()
+                    .collect();
+                (!names.is_empty()).then(|| (commit.id.clone(), names))
+            })
+            .collect()
+    }
+
+    /// Candidate commits with no candidate descendant.
+    ///
+    /// Propagating a single bit from leaves to roots avoids running a separate
+    /// ancestry walk for every candidate. The traversal derives its topology
+    /// from `commits`, rather than the UI's display order.
+    fn maximal_candidates<'a>(
+        &'a self,
+        candidates: &'a HashMap<String, Vec<String>>,
+    ) -> Vec<&'a String> {
+        let children = self.children();
+        let mut remaining_children: HashMap<_, _> = children
+            .iter()
+            .map(|(id, children)| (id.clone(), children.len()))
+            .collect();
+        let mut pending: Vec<_> = remaining_children
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut contains_candidate: HashSet<_> = candidates.keys().cloned().collect();
+        let mut has_candidate_descendant = HashSet::new();
+        while let Some(id) = pending.pop() {
+            let carries_candidate = contains_candidate.contains(&id);
+            if let Some(commit) = self.commits.get(&id) {
+                for parent in &commit.parents {
+                    let Some(remaining) = remaining_children.get_mut(parent) else {
+                        continue;
+                    };
+                    if carries_candidate {
+                        contains_candidate.insert(parent.clone());
+                        has_candidate_descendant.insert(parent.clone());
+                    }
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        pending.push(parent.clone());
+                    }
+                }
+            }
+        }
+        candidates
+            .keys()
+            .filter(|id| !has_candidate_descendant.contains(*id))
+            .collect()
+    }
+
     fn first_parent(&self, id: &str) -> Result<String, String> {
         let commit = self
             .commits
@@ -429,28 +527,8 @@ impl Graph {
             return Ok((branch.clone(), self.head.clone(), false));
         }
 
-        let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
-        for commit in self.commits.values() {
-            if !self.is_ancestor(&self.head, &commit.id) {
-                continue;
-            }
-            for name in &commit.local_refs {
-                if name.starts_with("fs-head/") {
-                    candidates
-                        .entry(commit.id.clone())
-                        .or_default()
-                        .push(name.clone());
-                }
-            }
-        }
-        let maximal: Vec<_> = candidates
-            .keys()
-            .filter(|id| {
-                !candidates
-                    .keys()
-                    .any(|other| *id != other && self.is_ancestor(id, other))
-            })
-            .collect();
+        let candidates = self.descendant_forkstack_candidates(&self.head, &HashSet::new());
+        let maximal = self.maximal_candidates(&candidates);
         if maximal.is_empty() {
             Ok((branch.clone(), self.head.clone(), true))
         } else if maximal.len() == 1 {
@@ -497,28 +575,8 @@ impl Graph {
         destination: &str,
         excluded: &HashSet<String>,
     ) -> Result<(String, String), String> {
-        let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
-        for commit in self.commits.values() {
-            if excluded.contains(&commit.id) || !self.is_ancestor(destination, &commit.id) {
-                continue;
-            }
-            for name in &commit.local_refs {
-                if name.starts_with("fs-head/") {
-                    candidates
-                        .entry(commit.id.clone())
-                        .or_default()
-                        .push(name.clone());
-                }
-            }
-        }
-        let maximal: Vec<_> = candidates
-            .keys()
-            .filter(|id| {
-                !candidates
-                    .keys()
-                    .any(|other| *id != other && self.is_ancestor(id, other))
-            })
-            .collect();
+        let candidates = self.descendant_forkstack_candidates(destination, excluded);
+        let maximal = self.maximal_candidates(&candidates);
         if maximal.is_empty() {
             Ok((destination.to_owned(), destination.to_owned()))
         } else if maximal.len() == 1 {

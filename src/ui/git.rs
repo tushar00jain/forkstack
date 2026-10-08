@@ -179,6 +179,22 @@ pub fn load_graph_for(repo: &Path, remote: &str, base: &str) -> Result<Graph, St
         walk.push(*root)
             .map_err(|error| error.message().to_owned())?;
     }
+    // The graph only needs the history where its visible roots differ.  Stop
+    // after their common merge base instead of walking shared history all the
+    // way to the repository root.  Keeping the merge base itself preserves
+    // the parent boundary used by move/reorder planning.
+    if roots.len() > 1 {
+        let roots: Vec<_> = roots.iter().copied().collect();
+        if let Ok(common) = repository.merge_base_octopus(&roots) {
+            let common = repository
+                .find_commit(common)
+                .map_err(|error| error.message().to_owned())?;
+            for parent in common.parent_ids() {
+                walk.hide(parent)
+                    .map_err(|error| error.message().to_owned())?;
+            }
+        }
+    }
     let mut commits = HashMap::new();
     let mut order = Vec::new();
     for oid in walk {
